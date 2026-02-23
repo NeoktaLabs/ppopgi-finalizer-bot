@@ -14,4 +14,4 @@ ATTEMPT_TTL_SEC = "600"
 # KV binding (you’ll paste the real id after creating KV)
 [[kv_namespaces]]
 binding = "BOT_STATE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "7be58949d65d4f4d8fa11bab19cbfb0c"
