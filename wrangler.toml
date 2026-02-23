@@ -4,7 +4,7 @@ compatibility_date = "2026-02-23"
 
 # Non-secret env vars (safe in git)
 [vars]
-REGISTRY_ADDRESS = "0xYOUR_REGISTRY_ADDRESS"
+REGISTRY_ADDRESS = "0xa916e20AbF4d57bCb98f7A845eb74f2EB4Dcbed2"
 RPC_URL = "https://node.mainnet.etherlink.com"
 CRON_EVERY_MINUTES = "3"
 MAX_TX = "5"
