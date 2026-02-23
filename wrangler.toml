@@ -1,0 +1,17 @@
+name = "lottery-finalizer-bot"
+main = "src/BotFinalizeLottery.ts"
+compatibility_date = "2026-02-23"
+
+# Non-secret env vars (safe in git)
+[vars]
+REGISTRY_ADDRESS = "0xYOUR_REGISTRY_ADDRESS"
+RPC_URL = "https://node.mainnet.etherlink.com"
+CRON_EVERY_MINUTES = "3"
+MAX_TX = "5"
+TIME_BUDGET_MS = "25000"
+ATTEMPT_TTL_SEC = "600"
+
+# KV binding (you’ll paste the real id after creating KV)
+[[kv_namespaces]]
+binding = "BOT_STATE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
