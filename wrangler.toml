@@ -15,3 +15,18 @@ ATTEMPT_TTL_SEC = "600"
 [[kv_namespaces]]
 binding = "BOT_STATE"
 id = "7be58949d65d4f4d8fa11bab19cbfb0c"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
