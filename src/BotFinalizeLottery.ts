@@ -1,4 +1,4 @@
-// BotFinalizeLottery.ts (UPDATED for SingleWinnerLottery: no paused(), adds hatch recovery, nonce safety, and fee refresh on WrongEntropyFee)
+// BotFinalizeLottery.ts (UPDATED: adds page-bounds clamping to avoid IndexOutOfBounds reverts)
 import {
   createPublicClient,
   createWalletClient,
@@ -32,6 +32,8 @@ export interface Env {
 const registryAbi = parseAbi([
   "function getAllLotteriesCount() external view returns (uint256)",
   "function getAllLotteries(uint256 start, uint256 limit) external view returns (address[])",
+  // ✅ NEW: lets us clamp (start,limit) safely and avoid IndexOutOfBounds
+  "function getAllLotteriesPageBounds(uint256 start, uint256 limit) external view returns (uint256 end, uint256 total)",
 ]);
 
 // ✅ UPDATED: remove paused(); add hatch recovery methods
@@ -422,15 +424,35 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     return 0;
   }
 
+  // ✅ NEW: page clamp helper (prevents IndexOutOfBounds on getAllLotteries)
+  const clampSize = async (start: bigint, limit: bigint): Promise<bigint> => {
+    if (limit <= 0n) return 0n;
+    const [end] = await withRetry(
+      () =>
+        client.readContract({
+          address: env.REGISTRY_ADDRESS as Address,
+          abi: registryAbi,
+          functionName: "getAllLotteriesPageBounds",
+          args: [start, limit],
+        }),
+      { tries: 3, baseDelayMs: 200, label: "getAllLotteriesPageBounds" }
+    );
+    const endBig = BigInt(end as unknown as bigint);
+    if (endBig <= start) return 0n;
+    return endBig - start;
+  };
+
   const startHot = total > HOT_SIZE ? total - HOT_SIZE : 0n;
-  const safeHotSize = total - startHot;
 
   const savedCursor = await env.BOT_STATE.get("cursor");
   let cursor = savedCursor ? BigInt(savedCursor) : 0n;
   if (cursor >= total) cursor = 0n;
 
   const startCold = cursor;
-  const safeColdSize = (total - startCold) < COLD_SIZE ? total - startCold : COLD_SIZE;
+
+  // ✅ UPDATED: clamp the sizes using registry bounds
+  const safeHotSize = await clampSize(startHot, HOT_SIZE);
+  const safeColdSize = await clampSize(startCold, COLD_SIZE);
 
   console.log(
     `🔍 Scanning: Hot[${startHot}..${startHot + safeHotSize}) Cold[${startCold}..${startCold + safeColdSize}) total=${total}`
@@ -461,6 +483,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
   );
 
+  // ✅ UPDATED: cursor advances by the clamped cold size
   let nextCursor = startCold + safeColdSize;
   if (nextCursor >= total) nextCursor = 0n;
 
