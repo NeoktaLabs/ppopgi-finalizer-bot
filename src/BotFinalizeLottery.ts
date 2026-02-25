@@ -1,4 +1,4 @@
-// BotFinalizeLottery.ts (UPDATED: adds page-bounds clamping to avoid IndexOutOfBounds reverts)
+// BotFinalizeLottery.ts
 import {
   createPublicClient,
   createWalletClient,
