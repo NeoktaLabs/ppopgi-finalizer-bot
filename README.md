@@ -1,3 +1,5 @@
+# Ppopgi (뽑기) Finalizer Bot
+
 Ppopgi Finalizer Bot is an off-chain automation service responsible for monitoring lottery states and triggering permissionless lifecycle transitions when conditions are met.
 
 The bot watches newly deployed lotteries through the registry and subgraph, tracking funding confirmations, ticket sales progress, deadline expiration and randomness states. When a lottery becomes eligible for drawing or requires recovery actions, the bot submits the appropriate on-chain transaction to finalize the draw or cancel stalled lotteries.
