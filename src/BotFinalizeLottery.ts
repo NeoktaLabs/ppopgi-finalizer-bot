@@ -32,11 +32,9 @@ export interface Env {
 const registryAbi = parseAbi([
   "function getAllLotteriesCount() external view returns (uint256)",
   "function getAllLotteries(uint256 start, uint256 limit) external view returns (address[])",
-  // ✅ NEW: lets us clamp (start,limit) safely and avoid IndexOutOfBounds
   "function getAllLotteriesPageBounds(uint256 start, uint256 limit) external view returns (uint256 end, uint256 total)",
 ]);
 
-// ✅ UPDATED: remove paused(); add hatch recovery methods
 const lotteryAbi = parseAbi([
   "function status() external view returns (uint8)",
   "function deadline() external view returns (uint64)",
@@ -52,7 +50,6 @@ const lotteryAbi = parseAbi([
   "function forceCancelStuck() external",
 ]);
 
-// ✅ Entropy V2 fee API used by your contract: getFeeV2(callbackGasLimit)
 const entropyAbi = parseAbi([
   "function getFeeV2(uint32 callbackGasLimit) external view returns (uint256)",
 ]);
@@ -107,13 +104,11 @@ function isTransientErrorMessage(msg: string): boolean {
   );
 }
 
-// Try to detect your custom error name from viem messages (best effort).
 function isWrongEntropyFeeMessage(msg: string): boolean {
   const m = msg.toLowerCase();
   return m.includes("wrongentropyfee") || (m.includes("wrong") && m.includes("entropy") && m.includes("fee"));
 }
 
-// Prioritization: sold-out first, then expired with sold>0, then expired sold==0
 function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): number {
   if (isFull) return 3;
   if (isExpired && sold > 0n) return 2;
@@ -121,7 +116,6 @@ function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): numbe
   return 0;
 }
 
-// map status number to label (your Solidity enum order)
 function statusLabel(s: bigint): string {
   switch (s) {
     case 0n:
@@ -175,6 +169,9 @@ async function withRetry<T>(
   throw lastErr;
 }
 
+/**
+ * ✅ KV writes only — NO deletes (avoids KV delete free-tier limit)
+ */
 async function kvPutSafe(env: Env, key: string, value: string, ttlSec = 7 * 24 * 3600) {
   try {
     await env.BOT_STATE.put(key, value, { expirationTtl: ttlSec });
@@ -183,9 +180,26 @@ async function kvPutSafe(env: Env, key: string, value: string, ttlSec = 7 * 24 *
   }
 }
 
-async function kvDelSafe(env: Env, key: string) {
+/**
+ * ✅ "Clear" a key without delete:
+ * - write empty sentinel with short TTL so it disappears soon
+ */
+async function kvClearSafe(env: Env, key: string, ttlSec = 120) {
   try {
-    await env.BOT_STATE.delete(key);
+    await env.BOT_STATE.put(key, "", { expirationTtl: Math.max(60, ttlSec) });
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * ✅ "Unlock" without delete:
+ * - set lock value to empty with very short TTL
+ * - lock TTL is still the ultimate safety
+ */
+async function kvUnlockSafe(env: Env, ttlSec = 10) {
+  try {
+    await env.BOT_STATE.put("lock", "", { expirationTtl: Math.max(5, ttlSec) });
   } catch {
     // ignore
   }
@@ -198,17 +212,12 @@ function getCronEveryMinutes(env: Env): number {
   return Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 1;
 }
 
-/**
- * Compute the next expected cron boundary strictly AFTER now.
- * Example: everyMinutes=3 -> boundaries at ... :00, :03, :06, :09 ...
- */
 function nextCronMs(nowMs = Date.now(), everyMinutes = 1): number {
   const m = Math.max(1, Math.floor(everyMinutes));
   const step = m * 60_000;
   return (Math.floor(nowMs / step) + 1) * step;
 }
 
-// A little helper to safely parse KV numbers
 function parseKvNum(v: string | null): number | null {
   if (!v) return null;
   const n = Number(v);
@@ -227,13 +236,6 @@ function corsHeadersFor(req: Request): Record<string, string> {
 
 // --- MAIN WORKER ---
 export default {
-  /**
-   * Status endpoint for your website.
-   * - GET /bot-status -> JSON
-   * Any other path: 404
-   *
-   * ✅ Includes CORS so your frontend (localhost / production) can read it.
-   */
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const cors = corsHeadersFor(req);
@@ -281,12 +283,16 @@ export default {
     const cronEveryMinutes = getCronEveryMinutes(env);
     const nextRun = nextCronMs(now, cronEveryMinutes);
 
+    // lock is considered "active" only if it's non-empty
+    const lockVal = (lock || "").trim();
+    const running = lockVal.length > 0;
+
     return new Response(
       JSON.stringify(
         {
           status: lastStatus || "unknown",
-          running: !!lock,
-          lockRunId: lock || null,
+          running,
+          lockRunId: running ? lockVal : null,
           lastRunId: lastRunId || null,
 
           lastRun,
@@ -301,7 +307,7 @@ export default {
           cronEveryMinutes,
           nextRun,
           secondsToNextRun: Math.max(0, Math.floor((nextRun - now) / 1000)),
-          lastError: lastError || null,
+          lastError: (lastError && lastError.trim()) ? lastError : null,
         },
         null,
         2
@@ -327,12 +333,15 @@ export default {
     await kvPutSafe(env, "last_run_ts", START_TIME.toString());
     await kvPutSafe(env, "last_run_status", "running");
     await kvPutSafe(env, "last_run_id", runId);
-    await kvDelSafe(env, "last_run_error");
-    await kvDelSafe(env, "last_run_duration_ms");
-    await kvDelSafe(env, "last_run_tx_count");
-    await kvDelSafe(env, "last_run_finished_ts");
 
-    const existingLock = await env.BOT_STATE.get("lock");
+    // ✅ NO deletes — clear via short-lived sentinels
+    await kvClearSafe(env, "last_run_error", 120);
+    await kvClearSafe(env, "last_run_duration_ms", 120);
+    await kvClearSafe(env, "last_run_tx_count", 120);
+    await kvClearSafe(env, "last_run_finished_ts", 120);
+
+    const existingLockRaw = await env.BOT_STATE.get("lock");
+    const existingLock = (existingLockRaw || "").trim();
     if (existingLock) {
       console.warn(`⚠️ Locked by run ${existingLock}. Skipping.`);
       await kvPutSafe(env, "last_run_status", "skipped_locked");
@@ -343,7 +352,8 @@ export default {
 
     await env.BOT_STATE.put("lock", runId, { expirationTtl: LOCK_TTL_SEC });
 
-    const confirmLock = await env.BOT_STATE.get("lock");
+    const confirmLockRaw = await env.BOT_STATE.get("lock");
+    const confirmLock = (confirmLockRaw || "").trim();
     if (confirmLock !== runId) {
       console.warn(`⚠️ Lock race lost. Exiting.`);
       await kvPutSafe(env, "last_run_status", "skipped_lock_race");
@@ -372,10 +382,13 @@ export default {
       await kvPutSafe(env, "last_run_finished_ts", finished.toString());
       await kvPutSafe(env, "last_run_duration_ms", String(finished - START_TIME));
 
-      const currentLock = await env.BOT_STATE.get("lock");
+      const currentLockRaw = await env.BOT_STATE.get("lock");
+      const currentLock = (currentLockRaw || "").trim();
+
+      // ✅ NO delete — unlock via short TTL sentinel
       if (currentLock === runId) {
-        await env.BOT_STATE.delete("lock");
-        console.log(`🔓 Lock released`);
+        await kvUnlockSafe(env, 10);
+        console.log(`🔓 Lock released (sentinel)`);
       }
     }
   },
@@ -389,7 +402,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const rpcUrl = env.RPC_URL || "https://node.mainnet.etherlink.com";
   const account = privateKeyToAccount(env.BOT_PRIVATE_KEY as Hex);
 
-  // Tighten RPC timeouts + retries to reduce “request took too long”
   const transport = http(rpcUrl, {
     timeout: 12_000,
     retryCount: 2,
@@ -424,7 +436,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     return 0;
   }
 
-  // ✅ NEW: page clamp helper (prevents IndexOutOfBounds on getAllLotteries)
   const clampSize = async (start: bigint, limit: bigint): Promise<bigint> => {
     if (limit <= 0n) return 0n;
     const [end] = await withRetry(
@@ -450,7 +461,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
   const startCold = cursor;
 
-  // ✅ UPDATED: clamp the sizes using registry bounds
   const safeHotSize = await clampSize(startHot, HOT_SIZE);
   const safeColdSize = await clampSize(startCold, COLD_SIZE);
 
@@ -483,7 +493,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
   );
 
-  // ✅ UPDATED: cursor advances by the clamped cold size
   let nextCursor = startCold + safeColdSize;
   if (nextCursor >= total) nextCursor = 0n;
 
@@ -510,7 +519,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   console.log(`🧪 status multicall: total=${statusResults.length} failures=${statusFailures}`);
 
   const openLotteries: Address[] = [];
-  const drawingLotteries: Address[] = []; // ✅ for stuck recovery
+  const drawingLotteries: Address[] = [];
 
   for (let i = 0; i < candidates.length; i++) {
     const r = statusResults[i];
@@ -548,7 +557,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       const tNow = nowSec();
 
-      // ✅ UPDATED: removed paused(), so 8 calls per lottery
       const detailCalls = chunk.flatMap((addr) => [
         { address: addr, abi: lotteryAbi, functionName: "deadline" },
         { address: addr, abi: lotteryAbi, functionName: "getSold" },
@@ -573,7 +581,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         maxTickets: bigint;
         entropyAddr: Address;
         providerAddr: Address;
-        callbackGasLimit: number; // uint32 fits in number
+        callbackGasLimit: number;
         isExpired: boolean;
         isFull: boolean;
         cancelPath: boolean;
@@ -660,7 +668,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath} gas=${c.callbackGasLimit})`
         );
 
-        // Fee lookup helper (can bypass cache on demand)
         const fetchFeeV2 = async (useCache: boolean): Promise<bigint> => {
           const feeKey = `feev2:${lower(c.entropyAddr)}:${c.callbackGasLimit}`;
           if (useCache) {
@@ -669,7 +676,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
               try {
                 return BigInt(cachedFee);
               } catch {
-                // fall through to fetch fresh
+                // fall through
               }
             }
           }
@@ -686,7 +693,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           );
 
           const v = BigInt(fee);
-          // keep short TTL; fee can change
           await env.BOT_STATE.put(feeKey, v.toString(), { expirationTtl: 60 });
           return v;
         };
@@ -705,7 +711,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           }
         }
 
-        // --- SIMULATE (with WrongEntropyFee refresh once) ---
         let simulated = false;
         for (let simTry = 0; simTry < 2; simTry++) {
           try {
@@ -725,13 +730,12 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           } catch (e: any) {
             const msg = (e?.shortMessage || e?.message || "").toString();
 
-            // If fee mismatch, refresh fee (no-cache) once and retry simulation
             if (!c.cancelPath && simTry === 0 && isWrongEntropyFeeMessage(msg)) {
               try {
                 value = await fetchFeeV2(false);
                 console.warn(`   ♻️ WrongEntropyFee detected; refreshed fee and retrying simulation.`);
                 continue;
-              } catch (e2: any) {
+              } catch {
                 console.warn(`   ⚠️ Fee refresh failed after WrongEntropyFee; skipping.`);
                 break;
               }
@@ -743,7 +747,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
             }
 
             console.warn(`   ⏭️ Simulation revert: ${msg}`);
-            // Short TTL for fee mismatch, otherwise medium
             const ttl = (!c.cancelPath && isWrongEntropyFeeMessage(msg)) ? 60 : Math.min(120, ATTEMPT_TTL_SEC);
             await env.BOT_STATE.put(attemptKey, `revert:${Date.now()}`, { expirationTtl: ttl });
             break;
@@ -754,7 +757,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
         await env.BOT_STATE.put(attemptKey, `${Date.now()}`, { expirationTtl: ATTEMPT_TTL_SEC });
 
-        // --- SEND TX (nonce safety) ---
         try {
           const nonceToUse = currentNonce;
           const hash = await withRetry(
@@ -770,7 +772,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
             { tries: 2, baseDelayMs: 250, label: "send finalize tx" }
           );
 
-          currentNonce++; // ✅ increment ONLY after we got a hash back
+          currentNonce++;
           console.log(`   ✅ Tx Sent: ${hash}`);
           txCount++;
         } catch (e: any) {
@@ -815,7 +817,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       console.log(`🧯 Hatch open: ${addr} -> forceCancelStuck()`);
 
-      // simulate
       try {
         await withRetry(
           () =>
@@ -838,7 +839,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       await env.BOT_STATE.put(attemptKey, `${Date.now()}`, { expirationTtl: ATTEMPT_TTL_SEC });
 
-      // send tx (nonce safety)
       try {
         const nonceToUse = currentNonce;
         const hash = await withRetry(
