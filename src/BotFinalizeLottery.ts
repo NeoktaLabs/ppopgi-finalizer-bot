@@ -53,7 +53,7 @@ export interface Env {
   HATCH_EXTRA_DELAY_SEC?: string; // default 900
 }
 
-// -------------------- DURABLE OBJECT: GLOBAL MUTEX --------------------
+// -------------------- DURABLE OBJECT: GLOBAL MUTEX + BOT META --------------------
 
 type LockState = {
   locked: boolean;
@@ -63,6 +63,21 @@ type LockState = {
   ownerMeta?: Record<string, any> | null;
 };
 
+type BotMeta = {
+  last_run_ts?: number | null;
+  last_run_finished_ts?: number | null;
+  last_ok_ts?: number | null;
+
+  last_run_status?: string | null;
+  last_run_error?: string | null;
+
+  last_run_id?: string | null;
+  last_run_duration_ms?: number | null;
+  last_run_tx_count?: number | null;
+
+  updated_at_ms?: number | null;
+};
+
 type LockAcquireResponse =
   | { ok: true; runId: string; acquiredAtMs: number; leaseMs: number }
   | { ok: false; runId: string | null; acquiredAtMs: number | null; leaseMs: number; reason: "locked" };
@@ -70,6 +85,7 @@ type LockAcquireResponse =
 type LockReleaseResponse = { ok: true } | { ok: false; reason: "not-owner" | "not-locked" };
 
 const DO_LOCK_STATE_KEY = "lock_state:v1";
+const DO_BOT_META_KEY = "bot_meta:v1";
 
 // Global lock: single DO instance, serialized by the platform.
 export class BotLockDO implements DurableObject {
@@ -79,7 +95,7 @@ export class BotLockDO implements DurableObject {
     this.state = state;
   }
 
-  private async readState(): Promise<LockState> {
+  private async readLockState(): Promise<LockState> {
     const s = (await this.state.storage.get(DO_LOCK_STATE_KEY)) as LockState | undefined;
     if (!s) {
       return { locked: false, runId: null, acquiredAtMs: null, leaseMs: 0, ownerMeta: null };
@@ -96,16 +112,30 @@ export class BotLockDO implements DurableObject {
     return s;
   }
 
-  private async writeState(s: LockState): Promise<void> {
+  private async writeLockState(s: LockState): Promise<void> {
     await this.state.storage.put(DO_LOCK_STATE_KEY, s);
+  }
+
+  private async readBotMeta(): Promise<BotMeta> {
+    const m = (await this.state.storage.get(DO_BOT_META_KEY)) as BotMeta | undefined;
+    return m || {};
+  }
+
+  private async mergeBotMeta(patch: Partial<BotMeta>): Promise<BotMeta> {
+    const cur = await this.readBotMeta();
+    const next: BotMeta = { ...cur, ...patch, updated_at_ms: Date.now() };
+    await this.state.storage.put(DO_BOT_META_KEY, next);
+    return next;
   }
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
 
+    // -------- Lock API --------
+
     if (req.method === "GET" && path === "/status") {
-      const s = await this.readState();
+      const s = await this.readLockState();
       return new Response(JSON.stringify(s, null, 2), {
         headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
       });
@@ -120,7 +150,7 @@ export class BotLockDO implements DurableObject {
       if (!runId) return new Response("Missing runId", { status: 400 });
 
       const now = Date.now();
-      const s = await this.readState();
+      const s = await this.readLockState();
 
       if (s.locked) {
         const resp: LockAcquireResponse = {
@@ -140,7 +170,7 @@ export class BotLockDO implements DurableObject {
         leaseMs: Number.isFinite(leaseMs) && leaseMs > 0 ? leaseMs : 180_000,
         ownerMeta,
       };
-      await this.writeState(next);
+      await this.writeLockState(next);
 
       const resp: LockAcquireResponse = { ok: true, runId, acquiredAtMs: now, leaseMs: next.leaseMs };
       return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
@@ -151,7 +181,7 @@ export class BotLockDO implements DurableObject {
       const runId = String(body?.runId || "");
       if (!runId) return new Response("Missing runId", { status: 400 });
 
-      const s = await this.readState();
+      const s = await this.readLockState();
       if (!s.locked) {
         const resp: LockReleaseResponse = { ok: false, reason: "not-locked" };
         return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
@@ -161,9 +191,34 @@ export class BotLockDO implements DurableObject {
         return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
       }
 
-      await this.writeState({ locked: false, runId: null, acquiredAtMs: null, leaseMs: 0, ownerMeta: null });
+      await this.writeLockState({ locked: false, runId: null, acquiredAtMs: null, leaseMs: 0, ownerMeta: null });
       const resp: LockReleaseResponse = { ok: true };
       return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
+    }
+
+    // -------- Bot meta API (strongly consistent) --------
+
+    if (req.method === "GET" && path === "/bot-meta") {
+      const meta = await this.readBotMeta();
+      return new Response(JSON.stringify(meta, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
+    if (req.method === "POST" && path === "/bot-meta") {
+      const patch = (await req.json().catch(() => ({}))) as Partial<BotMeta>;
+      const next = await this.mergeBotMeta(patch || {});
+      return new Response(JSON.stringify(next, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
+    // Optional combined debug view
+    if (req.method === "GET" && path === "/bot-status") {
+      const [lock, meta] = await Promise.all([this.readLockState(), this.readBotMeta()]);
+      return new Response(JSON.stringify({ lock, meta }, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
     }
 
     return new Response("Not Found", { status: 404 });
@@ -207,6 +262,21 @@ async function readDoLockStatus(env: Env): Promise<LockState> {
   const stub = lockStub(env);
   const res = await stub.fetch("https://lock/status", { method: "GET" });
   return (await res.json()) as LockState;
+}
+
+async function readDoBotMeta(env: Env): Promise<BotMeta> {
+  const stub = lockStub(env);
+  const res = await stub.fetch("https://lock/bot-meta", { method: "GET" });
+  return (await res.json()) as BotMeta;
+}
+
+async function patchDoBotMeta(env: Env, patch: Partial<BotMeta>): Promise<void> {
+  const stub = lockStub(env);
+  await stub.fetch("https://lock/bot-meta", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
 }
 
 // -------------------- ABIs --------------------
@@ -874,9 +944,10 @@ export default {
       );
     }
 
-    // --- Existing status endpoint ---
+    // --- Status endpoint ---
     if (url.pathname !== "/bot-status") return new Response("Not Found", { status: 404, headers: cors });
 
+    // KV reads (fallback + extra debug)
     const [
       lastRunTsRaw,
       lastFinishedTsRaw,
@@ -904,22 +975,40 @@ export default {
     ]);
 
     const now = Date.now();
-    const lastRun = parseKvNum(lastRunTsRaw);
-    const lastFinished = parseKvNum(lastFinishedTsRaw);
-    const lastOk = parseKvNum(lastOkTsRaw);
-    const durationMs = parseKvNum(lastDurationRaw);
-    const lastTxCount = parseKvNum(lastTxCountRaw);
+
+    // Parse KV fallback values
+    const kv_lastRun = parseKvNum(lastRunTsRaw);
+    const kv_lastFinished = parseKvNum(lastFinishedTsRaw);
+    const kv_lastOk = parseKvNum(lastOkTsRaw);
+    const kv_durationMs = parseKvNum(lastDurationRaw);
+    const kv_lastTxCount = parseKvNum(lastTxCountRaw);
+
+    // Strongly consistent DO reads
+    let lockInfo: LockState | null = null;
+    let meta: BotMeta | null = null;
+    try {
+      [lockInfo, meta] = await Promise.all([readDoLockStatus(env), readDoBotMeta(env)]);
+    } catch {
+      lockInfo = null;
+      meta = null;
+    }
+
+    // Prefer DO meta, fallback to KV if DO unavailable
+    const lastRun = meta?.last_run_ts ?? kv_lastRun ?? null;
+    const lastFinished = meta?.last_run_finished_ts ?? kv_lastFinished ?? null;
+    const lastOk = meta?.last_ok_ts ?? kv_lastOk ?? null;
+
+    const mergedStatus = meta?.last_run_status ?? (lastStatus || "unknown");
+    const mergedError =
+      (meta?.last_run_error && meta.last_run_error.trim() ? meta.last_run_error : null) ??
+      (lastError && lastError.trim() ? lastError : null);
+
+    const mergedRunId = meta?.last_run_id ?? (lastRunId || null);
+    const mergedDurationMs = meta?.last_run_duration_ms ?? kv_durationMs ?? null;
+    const mergedTxCount = meta?.last_run_tx_count ?? kv_lastTxCount ?? null;
 
     const cronEveryMinutes = getCronEveryMinutes(env);
     const nextRun = nextCronMs(now, cronEveryMinutes);
-
-    // ✅ Read lock status from DO (strong consistency)
-    let lockInfo: LockState | null = null;
-    try {
-      lockInfo = await readDoLockStatus(env);
-    } catch {
-      lockInfo = null;
-    }
 
     let watchCount: number | null = null;
     let deployerCursorFromState: string | null = null;
@@ -940,17 +1029,20 @@ export default {
     return new Response(
       JSON.stringify(
         {
-          status: lastStatus || "unknown",
+          status: mergedStatus || "unknown",
+
+          // ✅ DO is source of truth for "running"
           running: lockInfo?.locked ?? false,
           lockRunId: lockInfo?.locked ? lockInfo.runId : null,
           lockAcquiredAtMs: lockInfo?.acquiredAtMs ?? null,
           lockLeaseMs: lockInfo?.leaseMs ?? null,
 
-          lastRunId: lastRunId || null,
+          // ✅ DO-backed telemetry (KV fallback if DO read fails)
+          lastRunId: mergedRunId,
           lastRun,
           lastFinished,
-          durationMs,
-          txCount: lastTxCount,
+          durationMs: mergedDurationMs,
+          txCount: mergedTxCount,
 
           secondsSinceLastRun: lastRun ? Math.floor((now - lastRun) / 1000) : null,
           lastOk,
@@ -959,7 +1051,7 @@ export default {
           cronEveryMinutes,
           nextRun,
           secondsToNextRun: Math.max(0, Math.floor((nextRun - now) / 1000)),
-          lastError: lastError && lastError.trim() ? lastError : null,
+          lastError: mergedError,
 
           deployerCursorBlock: deployerBlockRaw ? Number(deployerBlockRaw) : null,
           ticketsCursorBlock: ticketsBlockRaw ? Number(ticketsBlockRaw) : null,
@@ -968,6 +1060,9 @@ export default {
           deployerCursorFromState,
           registryCursorFromState,
           ticketsCursorFromState,
+
+          doMetaUpdatedAtMs: meta?.updated_at_ms ?? null,
+          doAvailable: !!lockInfo && !!meta,
         },
         null,
         2
@@ -976,7 +1071,7 @@ export default {
         headers: {
           ...cors,
           "content-type": "application/json; charset=utf-8",
-          "cache-control": "public, max-age=2",
+          "cache-control": "no-store",
         },
       }
     );
@@ -992,6 +1087,7 @@ export default {
     const runId = crypto.randomUUID();
     console.log(`🤖 Run ${runId} started`);
 
+    // KV (fallback + debug)
     await kvPutSafe(env, "last_run_ts", START_TIME.toString());
     await kvPutSafe(env, "last_run_status", "running");
     await kvPutSafe(env, "last_run_id", runId);
@@ -1001,6 +1097,21 @@ export default {
     await kvClearSafe(env, "last_run_tx_count", 120);
     await kvClearSafe(env, "last_run_finished_ts", 120);
 
+    // ✅ DO meta (source of truth for /bot-status)
+    try {
+      await patchDoBotMeta(env, {
+        last_run_ts: START_TIME,
+        last_run_status: "running",
+        last_run_id: runId,
+        last_run_error: null,
+        last_run_duration_ms: null,
+        last_run_tx_count: null,
+        last_run_finished_ts: null,
+      });
+    } catch {
+      // ignore; KV remains fallback
+    }
+
     // ✅ Strongly consistent lock via Durable Object
     let acquired: LockAcquireResponse;
     try {
@@ -1008,17 +1119,38 @@ export default {
     } catch (e: any) {
       const msg = (e?.message || String(e)).toString();
       console.warn(`⚠️ Lock DO acquire error: ${msg}`);
+
       await kvPutSafe(env, "last_run_status", "skipped_lock_error");
       await kvPutSafe(env, "last_run_finished_ts", Date.now().toString());
       await kvPutSafe(env, "last_run_duration_ms", String(Date.now() - START_TIME));
+
+      try {
+        await patchDoBotMeta(env, {
+          last_run_status: "skipped_lock_error",
+          last_run_error: msg.slice(0, 500),
+          last_run_finished_ts: Date.now(),
+          last_run_duration_ms: Date.now() - START_TIME,
+        });
+      } catch {}
+
       return;
     }
 
     if (!acquired.ok) {
       console.warn(`⚠️ Locked by run ${acquired.runId ?? "unknown"}. Skipping.`);
+
       await kvPutSafe(env, "last_run_status", "skipped_locked");
       await kvPutSafe(env, "last_run_finished_ts", Date.now().toString());
       await kvPutSafe(env, "last_run_duration_ms", String(Date.now() - START_TIME));
+
+      try {
+        await patchDoBotMeta(env, {
+          last_run_status: "skipped_locked",
+          last_run_finished_ts: Date.now(),
+          last_run_duration_ms: Date.now() - START_TIME,
+        });
+      } catch {}
+
       return;
     }
 
@@ -1030,6 +1162,14 @@ export default {
       await kvPutSafe(env, "last_run_status", "ok");
       await kvPutSafe(env, "last_ok_ts", Date.now().toString());
       await kvPutSafe(env, "last_run_tx_count", String(txCount));
+
+      try {
+        await patchDoBotMeta(env, {
+          last_run_status: "ok",
+          last_ok_ts: Date.now(),
+          last_run_tx_count: txCount,
+        });
+      } catch {}
     } catch (e: any) {
       const msg = (e?.message || String(e)).toString();
       console.error("❌ Critical Error:", msg);
@@ -1037,10 +1177,26 @@ export default {
       await kvPutSafe(env, "last_run_status", "error");
       await kvPutSafe(env, "last_run_error", msg.slice(0, 500));
       await kvPutSafe(env, "last_run_tx_count", String(txCount));
+
+      try {
+        await patchDoBotMeta(env, {
+          last_run_status: "error",
+          last_run_error: msg.slice(0, 500),
+          last_run_tx_count: txCount,
+        });
+      } catch {}
     } finally {
       const finished = Date.now();
+
       await kvPutSafe(env, "last_run_finished_ts", finished.toString());
       await kvPutSafe(env, "last_run_duration_ms", String(finished - START_TIME));
+
+      try {
+        await patchDoBotMeta(env, {
+          last_run_finished_ts: finished,
+          last_run_duration_ms: finished - START_TIME,
+        });
+      } catch {}
 
       // ✅ Release DO lock (best-effort)
       try {
@@ -1056,7 +1212,7 @@ export default {
 };
 
 // -------------------- Core logic --------------------
-
+// NOTE: runLogic and all remaining code below is unchanged from your original file.
 async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   if (!env.BOT_PRIVATE_KEY || !env.REGISTRY_ADDRESS || !env.DEPLOYER_ADDRESS) {
     throw new Error("Missing Env: BOT_PRIVATE_KEY/REGISTRY_ADDRESS/DEPLOYER_ADDRESS");
