@@ -11,7 +11,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { etherlink } from "viem/chains";
 
-// --- TYPES & INTERFACES ---
+// -------------------- TYPES & INTERFACES --------------------
+
 export interface Env {
   BOT_PRIVATE_KEY: string;
 
@@ -23,6 +24,9 @@ export interface Env {
 
   RPC_URL?: string;
   BOT_STATE: KVNamespace;
+
+  // ✅ Durable Object mutex (global lock)
+  BOT_LOCK: DurableObjectNamespace;
 
   HOT_SIZE?: string;
   COLD_SIZE?: string;
@@ -49,6 +53,162 @@ export interface Env {
   HATCH_EXTRA_DELAY_SEC?: string; // default 900
 }
 
+// -------------------- DURABLE OBJECT: GLOBAL MUTEX --------------------
+
+type LockState = {
+  locked: boolean;
+  runId: string | null;
+  acquiredAtMs: number | null;
+  leaseMs: number;
+  ownerMeta?: Record<string, any> | null;
+};
+
+type LockAcquireResponse =
+  | { ok: true; runId: string; acquiredAtMs: number; leaseMs: number }
+  | { ok: false; runId: string | null; acquiredAtMs: number | null; leaseMs: number; reason: "locked" };
+
+type LockReleaseResponse = { ok: true } | { ok: false; reason: "not-owner" | "not-locked" };
+
+const DO_LOCK_STATE_KEY = "lock_state:v1";
+
+// Global lock: single DO instance, serialized by the platform.
+export class BotLockDO implements DurableObject {
+  private state: DurableObjectState;
+
+  constructor(state: DurableObjectState) {
+    this.state = state;
+  }
+
+  private async readState(): Promise<LockState> {
+    const s = (await this.state.storage.get(DO_LOCK_STATE_KEY)) as LockState | undefined;
+    if (!s) {
+      return { locked: false, runId: null, acquiredAtMs: null, leaseMs: 0, ownerMeta: null };
+    }
+    // If lease expired, auto-unlock on read.
+    if (s.locked && s.acquiredAtMs != null && s.leaseMs > 0) {
+      const now = Date.now();
+      if (now - s.acquiredAtMs > s.leaseMs) {
+        const cleared: LockState = { locked: false, runId: null, acquiredAtMs: null, leaseMs: 0, ownerMeta: null };
+        await this.state.storage.put(DO_LOCK_STATE_KEY, cleared);
+        return cleared;
+      }
+    }
+    return s;
+  }
+
+  private async writeState(s: LockState): Promise<void> {
+    await this.state.storage.put(DO_LOCK_STATE_KEY, s);
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname;
+
+    if (req.method === "GET" && path === "/status") {
+      const s = await this.readState();
+      return new Response(JSON.stringify(s, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
+    if (req.method === "POST" && path === "/acquire") {
+      const body = (await req.json().catch(() => ({}))) as any;
+      const runId = String(body?.runId || "");
+      const leaseMs = Number(body?.leaseMs || 0);
+      const ownerMeta = body?.ownerMeta && typeof body.ownerMeta === "object" ? body.ownerMeta : null;
+
+      if (!runId) return new Response("Missing runId", { status: 400 });
+
+      const now = Date.now();
+      const s = await this.readState();
+
+      if (s.locked) {
+        const resp: LockAcquireResponse = {
+          ok: false,
+          runId: s.runId,
+          acquiredAtMs: s.acquiredAtMs,
+          leaseMs: s.leaseMs,
+          reason: "locked",
+        };
+        return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
+      }
+
+      const next: LockState = {
+        locked: true,
+        runId,
+        acquiredAtMs: now,
+        leaseMs: Number.isFinite(leaseMs) && leaseMs > 0 ? leaseMs : 180_000,
+        ownerMeta,
+      };
+      await this.writeState(next);
+
+      const resp: LockAcquireResponse = { ok: true, runId, acquiredAtMs: now, leaseMs: next.leaseMs };
+      return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
+    }
+
+    if (req.method === "POST" && path === "/release") {
+      const body = (await req.json().catch(() => ({}))) as any;
+      const runId = String(body?.runId || "");
+      if (!runId) return new Response("Missing runId", { status: 400 });
+
+      const s = await this.readState();
+      if (!s.locked) {
+        const resp: LockReleaseResponse = { ok: false, reason: "not-locked" };
+        return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
+      }
+      if (s.runId !== runId) {
+        const resp: LockReleaseResponse = { ok: false, reason: "not-owner" };
+        return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
+      }
+
+      await this.writeState({ locked: false, runId: null, acquiredAtMs: null, leaseMs: 0, ownerMeta: null });
+      const resp: LockReleaseResponse = { ok: true };
+      return new Response(JSON.stringify(resp), { headers: { "content-type": "application/json" } });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
+}
+
+function lockStub(env: Env) {
+  // Single global lock instance.
+  const id = env.BOT_LOCK.idFromName("global-finalizer-lock");
+  return env.BOT_LOCK.get(id);
+}
+
+async function acquireDoLock(env: Env, runId: string, leaseMs: number): Promise<LockAcquireResponse> {
+  const stub = lockStub(env);
+  const res = await stub.fetch("https://lock/acquire", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      runId,
+      leaseMs,
+      ownerMeta: {
+        // helpful for debugging; safe non-secret context
+        ts: Date.now(),
+      },
+    }),
+  });
+  return (await res.json()) as LockAcquireResponse;
+}
+
+async function releaseDoLock(env: Env, runId: string): Promise<LockReleaseResponse> {
+  const stub = lockStub(env);
+  const res = await stub.fetch("https://lock/release", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ runId }),
+  });
+  return (await res.json()) as LockReleaseResponse;
+}
+
+async function readDoLockStatus(env: Env): Promise<LockState> {
+  const stub = lockStub(env);
+  const res = await stub.fetch("https://lock/status", { method: "GET" });
+  return (await res.json()) as LockState;
+}
+
 // -------------------- ABIs --------------------
 
 const registryAbi = parseAbi([
@@ -68,7 +228,6 @@ const lotteryAbi = parseAbi([
   "function entropyRequestId() external view returns (uint64)",
   "function callbackGasLimit() external view returns (uint32)",
   "function isHatchOpen() external view returns (bool)",
-  // ✅ to add an extra buffer beyond hatch opening
   "function drawingRequestedAt() external view returns (uint64)",
   "function finalize() external payable",
   "function forceCancelStuck() external",
@@ -81,7 +240,7 @@ const lotteryDeployedEvent = parseAbiItem(
   "event LotteryDeployed(address indexed lottery,address indexed creator,uint256 winningPot,uint256 ticketPrice,string name,address usdc,address entropy,address entropyProvider,uint32 callbackGasLimit,address feeRecipient,uint256 protocolFeePercent,uint64 deadline,uint64 minTickets,uint64 maxTickets)"
 );
 
-// ✅ TicketsPurchased event for “sold-out fast-path”
+// TicketsPurchased event for “sold-out fast-path”
 const ticketsPurchasedEvent = parseAbiItem(
   "event TicketsPurchased(address indexed buyer,uint256 count,uint256 totalCost,uint256 totalSold,uint256 rangeIndex,bool isNewRange)"
 );
@@ -146,13 +305,11 @@ function isTransientErrorMessage(msg: string): boolean {
   );
 }
 
-// Try to detect your custom error name from viem messages (best effort).
 function isWrongEntropyFeeMessage(msg: string): boolean {
   const m = msg.toLowerCase();
   return m.includes("wrongentropyfee") || (m.includes("wrong") && m.includes("entropy") && m.includes("fee"));
 }
 
-// Prioritization: sold-out first, then expired with sold>0, then expired sold==0
 function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): number {
   if (isFull) return 3;
   if (isExpired && sold > 0n) return 2;
@@ -160,7 +317,6 @@ function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): numbe
   return 0;
 }
 
-// map status number to label (your Solidity enum order)
 function statusLabel(s: bigint): string {
   switch (s) {
     case 0n:
@@ -237,18 +393,6 @@ async function kvClearSafe(env: Env, key: string, ttlSec = 120) {
   }
 }
 
-/**
- * ✅ "Unlock" without delete:
- * - set lock value to empty with very short TTL
- */
-async function kvUnlockSafe(env: Env, ttlSec = 10) {
-  try {
-    await env.BOT_STATE.put("lock", "", { expirationTtl: Math.max(5, ttlSec) });
-  } catch {
-    // ignore
-  }
-}
-
 // ✅ NEW: nonce resync helper (prevents "broadcast succeeded but client errored" nonce drift)
 async function resyncNonce(
   client: ReturnType<typeof createPublicClient>,
@@ -272,28 +416,17 @@ type WatchEntry = {
   addr: Address;
   addedAt: number; // unix sec
   source?: "deployer" | "registry_hot" | "registry_cold";
-
-  // optional metadata for debugging/UX
   lastStatus?: number; // 0..4
   lastCheckedAt?: number; // unix sec
 };
 
 type BotStateV1 = {
   v: 1;
-
-  // addressLower -> entry
   watch: Record<string, WatchEntry>;
-
-  // throttling: attemptKey -> lastAttempt unix sec
   attempts: Record<string, number>;
-
-  // cursors
   deployerCursor?: string; // bigint-as-string
   registryCursor?: string; // bigint-as-string
-
-  // TicketsPurchased log cursor (bigint-as-string)
-  ticketsCursor?: string;
-
+  ticketsCursor?: string; // bigint-as-string
   runCounter: number;
   updatedAt: number; // unix sec
 };
@@ -325,10 +458,8 @@ async function loadState(env: Env): Promise<BotStateV1> {
 
 async function saveState(env: Env, state: BotStateV1): Promise<void> {
   state.updatedAt = nowSec();
-  // keep state around long-term
   await kvPutSafe(env, STATE_KEY, JSON.stringify(state), 365 * 24 * 3600);
 
-  // optional: also keep cursors as standalone keys for visibility/debugging
   if (state.deployerCursor) await kvPutSafe(env, DEPLOYER_CURSOR_KEY_FALLBACK, state.deployerCursor, 365 * 24 * 3600);
   if (state.registryCursor) await kvPutSafe(env, REGISTRY_CURSOR_KEY_FALLBACK, state.registryCursor, 365 * 24 * 3600);
   if (state.ticketsCursor) await kvPutSafe(env, TICKETS_CURSOR_KEY_FALLBACK, state.ticketsCursor, 365 * 24 * 3600);
@@ -341,11 +472,7 @@ function watchKey(addr: Address): string {
 function addToWatch(state: BotStateV1, addr: Address, source: WatchEntry["source"], addedAt?: number): boolean {
   const k = watchKey(addr);
   if (state.watch[k]) return false;
-  state.watch[k] = {
-    addr,
-    addedAt: addedAt ?? nowSec(),
-    source,
-  };
+  state.watch[k] = { addr, addedAt: addedAt ?? nowSec(), source };
   return true;
 }
 
@@ -379,10 +506,6 @@ function markAttempt(state: BotStateV1, attemptKey: string) {
 
 // -------------------- Deployer log polling --------------------
 
-/**
- * Discover newly created lotteries from the Deployer event log.
- * Chunked to avoid RPC "Block range is too large".
- */
 async function pollDeployerForNewLotteries(
   env: Env,
   state: BotStateV1,
@@ -402,7 +525,6 @@ async function pollDeployerForNewLotteries(
 
   const lastScanned = parseBigIntOrNull(state.deployerCursor ?? (await env.BOT_STATE.get(DEPLOYER_CURSOR_KEY_FALLBACK)));
 
-  // Never bootstrap from 0 unless chain head is tiny
   const bootstrapFrom = toBlock > lookbackBlocks ? toBlock - lookbackBlocks : 0n;
 
   let fromBlock = lastScanned != null ? lastScanned + 1n : bootstrapFrom;
@@ -412,7 +534,6 @@ async function pollDeployerForNewLotteries(
   let scannedTo = lastScanned ?? fromBlock - 1n;
 
   while (fromBlock <= toBlock) {
-    // leave time for finalize/hatch work
     if (Date.now() - startTimeMs > timeBudgetMs - 2000) break;
 
     const end = fromBlock + chunkBlocks > toBlock ? toBlock : fromBlock + chunkBlocks;
@@ -445,7 +566,6 @@ async function pollDeployerForNewLotteries(
 
     scannedTo = end;
     state.deployerCursor = scannedTo.toString();
-
     fromBlock = end + 1n;
   }
 
@@ -531,7 +651,6 @@ async function registryRollingScan(
     { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
   );
 
-  // advance cursor
   let nextCursor = startCold + safeColdSize;
   if (nextCursor >= totalBig) nextCursor = 0n;
   state.registryCursor = nextCursor.toString();
@@ -557,7 +676,6 @@ async function pollSoldOutFromTicketsPurchased(
 ): Promise<Address[]> {
   if (watchAddrs.length === 0) return [];
 
-  // keep this bounded — fast-path is for “near head”
   const lookback = BigInt(getSafeInt(env.TICKETS_LOOKBACK_BLOCKS, 2500, 250_000));
   const headLag = BigInt(getSafeInt(env.TICKETS_HEAD_LAG_BLOCKS, 2, 50));
   const addrChunk = getSafeInt(env.TICKETS_ADDR_CHUNK, 50, 250);
@@ -567,31 +685,20 @@ async function pollSoldOutFromTicketsPurchased(
   const head = await withRetry(() => client.getBlockNumber(), { tries: 3, baseDelayMs: 250, label: "getBlockNumber" });
   const toBlock = head > headLag ? head - headLag : head;
 
-  // cursor fallback: allows continuity across long downtimes
   const lastScanned = parseBigIntOrNull(state.ticketsCursor ?? (await env.BOT_STATE.get(TICKETS_CURSOR_KEY_FALLBACK)));
 
-  // default: only scan near-head window
   const bootstrapFrom = toBlock > lookback ? toBlock - lookback : 0n;
 
   let fromBlock = lastScanned != null ? lastScanned + 1n : bootstrapFrom;
-
-  // never scan earlier than bootstrapFrom (prevents massive scans if cursor is super old)
   if (fromBlock < bootstrapFrom) fromBlock = bootstrapFrom;
-
   if (fromBlock > toBlock) return [];
 
-  // Collect max totalSold observed per lottery address (from event arg totalSold)
   const soldSeen = new Map<string, bigint>();
-
-  // Chunk addresses to keep getLogs calls manageable
   const addrChunks = chunkArray(watchAddrs, addrChunk);
-
   let scannedTo = lastScanned ?? fromBlock - 1n;
 
   while (fromBlock <= toBlock) {
-    // leave time for finalize/hatch work
     if (Date.now() - startTimeMs > timeBudgetMs - 4000) break;
-
     const end = fromBlock + chunkBlocks > toBlock ? toBlock : fromBlock + chunkBlocks;
 
     for (const addrs of addrChunks) {
@@ -636,7 +743,6 @@ async function pollSoldOutFromTicketsPurchased(
 
   if (soldSeen.size === 0) return [];
 
-  // Read maxTickets for the lotteries that had ticket events
   const lots = Array.from(soldSeen.keys()).map((k) => k as Address);
   const maxTicketsResults = await withRetry(
     () =>
@@ -657,7 +763,7 @@ async function pollSoldOutFromTicketsPurchased(
     if (r.status !== "success") continue;
 
     const maxT = BigInt(r.result as any);
-    if (maxT <= 0n) continue; // no cap => sold-out concept doesn't apply
+    if (maxT <= 0n) continue;
 
     const seen = soldSeen.get(lower(addr)) ?? 0n;
     if (seen >= maxT) urgent.push(addr);
@@ -718,13 +824,10 @@ export default {
       const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit") || "50") | 0));
 
       const entries = Object.values(state.watch);
-
-      // newest first
       entries.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
 
       const page = entries.slice(start, start + limit);
 
-      // breakdown by lastStatus for quick debugging
       const counts: Record<string, number> = { unknown: 0, "0": 0, "1": 0, "2": 0, "3": 0, "4": 0 };
       for (const e of entries) {
         if (typeof e.lastStatus !== "number") counts.unknown++;
@@ -780,7 +883,6 @@ export default {
       lastOkTsRaw,
       lastStatus,
       lastError,
-      lock,
       lastRunId,
       lastDurationRaw,
       lastTxCountRaw,
@@ -793,7 +895,6 @@ export default {
       env.BOT_STATE.get("last_ok_ts"),
       env.BOT_STATE.get("last_run_status"),
       env.BOT_STATE.get("last_run_error"),
-      env.BOT_STATE.get("lock"),
       env.BOT_STATE.get("last_run_id"),
       env.BOT_STATE.get("last_run_duration_ms"),
       env.BOT_STATE.get("last_run_tx_count"),
@@ -812,8 +913,13 @@ export default {
     const cronEveryMinutes = getCronEveryMinutes(env);
     const nextRun = nextCronMs(now, cronEveryMinutes);
 
-    const lockVal = (lock || "").trim();
-    const running = lockVal.length > 0;
+    // ✅ Read lock status from DO (strong consistency)
+    let lockInfo: LockState | null = null;
+    try {
+      lockInfo = await readDoLockStatus(env);
+    } catch {
+      lockInfo = null;
+    }
 
     let watchCount: number | null = null;
     let deployerCursorFromState: string | null = null;
@@ -835,10 +941,12 @@ export default {
       JSON.stringify(
         {
           status: lastStatus || "unknown",
-          running,
-          lockRunId: running ? lockVal : null,
-          lastRunId: lastRunId || null,
+          running: lockInfo?.locked ?? false,
+          lockRunId: lockInfo?.locked ? lockInfo.runId : null,
+          lockAcquiredAtMs: lockInfo?.acquiredAtMs ?? null,
+          lockLeaseMs: lockInfo?.leaseMs ?? null,
 
+          lastRunId: lastRunId || null,
           lastRun,
           lastFinished,
           durationMs,
@@ -856,7 +964,6 @@ export default {
           deployerCursorBlock: deployerBlockRaw ? Number(deployerBlockRaw) : null,
           ticketsCursorBlock: ticketsBlockRaw ? Number(ticketsBlockRaw) : null,
 
-          // helpful debug signals
           watchlistCount: watchCount,
           deployerCursorFromState,
           registryCursorFromState,
@@ -877,38 +984,39 @@ export default {
 
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     const START_TIME = Date.now();
-    const LOCK_TTL_SEC = 180;
-    const runId = crypto.randomUUID();
 
+    // Use lease slightly longer than your time budget, with a floor.
+    const TIME_BUDGET_MS = getSafeInt(env.TIME_BUDGET_MS, 25_000, 45_000);
+    const LEASE_MS = Math.max(90_000, Math.min(240_000, TIME_BUDGET_MS + 60_000));
+
+    const runId = crypto.randomUUID();
     console.log(`🤖 Run ${runId} started`);
 
     await kvPutSafe(env, "last_run_ts", START_TIME.toString());
     await kvPutSafe(env, "last_run_status", "running");
     await kvPutSafe(env, "last_run_id", runId);
 
-    // NO deletes — clear via short-lived sentinels
     await kvClearSafe(env, "last_run_error", 120);
     await kvClearSafe(env, "last_run_duration_ms", 120);
     await kvClearSafe(env, "last_run_tx_count", 120);
     await kvClearSafe(env, "last_run_finished_ts", 120);
 
-    const existingLockRaw = await env.BOT_STATE.get("lock");
-    const existingLock = (existingLockRaw || "").trim();
-    if (existingLock) {
-      console.warn(`⚠️ Locked by run ${existingLock}. Skipping.`);
-      await kvPutSafe(env, "last_run_status", "skipped_locked");
+    // ✅ Strongly consistent lock via Durable Object
+    let acquired: LockAcquireResponse;
+    try {
+      acquired = await acquireDoLock(env, runId, LEASE_MS);
+    } catch (e: any) {
+      const msg = (e?.message || String(e)).toString();
+      console.warn(`⚠️ Lock DO acquire error: ${msg}`);
+      await kvPutSafe(env, "last_run_status", "skipped_lock_error");
       await kvPutSafe(env, "last_run_finished_ts", Date.now().toString());
       await kvPutSafe(env, "last_run_duration_ms", String(Date.now() - START_TIME));
       return;
     }
 
-    await env.BOT_STATE.put("lock", runId, { expirationTtl: LOCK_TTL_SEC });
-
-    const confirmLockRaw = await env.BOT_STATE.get("lock");
-    const confirmLock = (confirmLockRaw || "").trim();
-    if (confirmLock !== runId) {
-      console.warn(`⚠️ Lock race lost. Exiting.`);
-      await kvPutSafe(env, "last_run_status", "skipped_lock_race");
+    if (!acquired.ok) {
+      console.warn(`⚠️ Locked by run ${acquired.runId ?? "unknown"}. Skipping.`);
+      await kvPutSafe(env, "last_run_status", "skipped_locked");
       await kvPutSafe(env, "last_run_finished_ts", Date.now().toString());
       await kvPutSafe(env, "last_run_duration_ms", String(Date.now() - START_TIME));
       return;
@@ -934,11 +1042,14 @@ export default {
       await kvPutSafe(env, "last_run_finished_ts", finished.toString());
       await kvPutSafe(env, "last_run_duration_ms", String(finished - START_TIME));
 
-      const currentLockRaw = await env.BOT_STATE.get("lock");
-      const currentLock = (currentLockRaw || "").trim();
-      if (currentLock === runId) {
-        await kvUnlockSafe(env, 10);
-        console.log(`🔓 Lock released (sentinel)`);
+      // ✅ Release DO lock (best-effort)
+      try {
+        const rel = await releaseDoLock(env, runId);
+        if (rel.ok) console.log(`🔓 Lock released (DO)`);
+        else console.warn(`⚠️ Lock release refused: ${rel.reason}`);
+      } catch (e: any) {
+        const msg = (e?.message || String(e)).toString();
+        console.warn(`⚠️ Lock DO release error: ${msg}`);
       }
     }
   },
@@ -965,7 +1076,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const TIME_BUDGET_MS = getSafeInt(env.TIME_BUDGET_MS, 25_000, 45_000);
   const ATTEMPT_TTL_SEC = getSafeInt(env.ATTEMPT_TTL_SEC, 600, 3600);
 
-  // extra time buffer beyond hatch opening (default 15m)
   const HATCH_EXTRA_DELAY_SEC = getSafeInt(env.HATCH_EXTRA_DELAY_SEC, 900, 24 * 3600);
 
   const state = await loadState(env);
@@ -973,19 +1083,13 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
   pruneAttempts(state, ATTEMPT_TTL_SEC);
 
-  // -----------------------------
-  // (A) Discovery -> watchlist
-  // -----------------------------
   const beforeWatchCount = Object.keys(state.watch).length;
 
   const dep = await pollDeployerForNewLotteries(env, state, client, startTimeMs, TIME_BUDGET_MS);
-
-  // Registry rolling scan EVERY RUN (hot tail + cold cursor)
   const reg = await registryRollingScan(env, state, client);
 
   const afterDiscoveryCount = Object.keys(state.watch).length;
 
-  // Nice delta logging (capped)
   const addedAll = [...dep.added, ...reg.hotAdded, ...reg.coldAdded];
   if (addedAll.length > 0) {
     const sample = addedAll.slice(0, 10);
@@ -996,10 +1100,8 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     console.log(`📌 Watchlist discovery: added=0 watchlist=${afterDiscoveryCount}`);
   }
 
-  // Candidates = watchlist (bounded)
   const watchEntries = Object.values(state.watch);
 
-  // If huge, bound how many we try to status-check per run
   const MAX_WATCH_CHECK = 3000;
   const candidates: Address[] = watchEntries
     .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
@@ -1012,12 +1114,8 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     return 0;
   }
 
-  // -----------------------------
-  // (B) SOLD-OUT FAST-PATH (tickets logs near head)
-  // -----------------------------
   const urgentSoldOut = await pollSoldOutFromTicketsPurchased(env, state, client, startTimeMs, TIME_BUDGET_MS, candidates);
 
-  // status multicall
   const statusResults = await withRetry(
     () =>
       client.multicall({
@@ -1034,7 +1132,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const drawingLotteries: Address[] = [];
   const doneLotteries: Address[] = [];
 
-  // update lastStatus + lastCheckedAt for debug endpoint
   const tNow = nowSec();
 
   for (let i = 0; i < candidates.length; i++) {
@@ -1054,7 +1151,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     else if (s === 3 || s === 4) doneLotteries.push(addr);
   }
 
-  // prune completed/canceled from watchlist
   const removed: Address[] = [];
   for (const d of doneLotteries) {
     if (removeFromWatch(state, d)) removed.push(d);
@@ -1080,10 +1176,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   let currentNonce = currentNonceStart;
   let txCount = 0;
 
-  // -----------------------------
-  // 1) Finalize Open lotteries
-  //    Urgent sold-out first
-  // -----------------------------
   if (openLotteries.length > 0) {
     const urgentSet = new Set(urgentSoldOut.map((a) => lower(a)));
     const urgentOpen = openLotteries.filter((a) => urgentSet.has(lower(a)));
@@ -1103,17 +1195,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       const tNowSec = BigInt(nowSec());
 
-      // include status() and require Open at decision time
-      // 9 calls per address:
-      // 0 status
-      // 1 deadline
-      // 2 sold
-      // 3 minTickets
-      // 4 maxTickets
-      // 5 entropy
-      // 6 entropyProvider (kept)
-      // 7 entropyRequestId
-      // 8 callbackGasLimit
       const detailCalls = chunk.flatMap((addr) => [
         { address: addr, abi: lotteryAbi, functionName: "status" },
         { address: addr, abi: lotteryAbi, functionName: "deadline" },
@@ -1173,7 +1254,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           continue;
 
         const statusNow = BigInt(rStatus.result as any);
-        if (statusNow !== 1n) continue; // must still be Open
+        if (statusNow !== 1n) continue;
 
         const reqId = BigInt(rReq.result as any);
         if (reqId !== 0n) continue;
@@ -1191,8 +1272,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         if (!isExpired && !isFull) continue;
 
         const cancelPath = isExpired && sold < minTickets;
-
-        // defensive: never try draw-path with sold==0
         if (!cancelPath && sold === 0n) continue;
 
         actionable.push({
@@ -1212,7 +1291,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       if (actionable.length === 0) continue;
 
-      // If sold-out urgent was detected, bump it to the top within this batch.
       actionable.sort((a, b) => {
         const au = urgentSet.has(lower(a.addr)) ? 1 : 0;
         const bu = urgentSet.has(lower(b.addr)) ? 1 : 0;
@@ -1274,7 +1352,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           }
         }
 
-        // simulate (refresh fee once if WrongEntropyFee)
         let simulated = false;
         let simWasTransient = false;
 
@@ -1318,7 +1395,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           }
         }
 
-        // only throttle if not transient
         if (!simWasTransient) {
           markAttempt(state, attemptKey);
         }
@@ -1346,11 +1422,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         } catch (e: any) {
           const msg = (e?.shortMessage || e?.message || "").toString();
           console.warn(`   ⏭️ finalize Tx failed: ${msg}`);
-          // resync nonce on send errors
           currentNonce = await resyncNonce(client, account.address, currentNonce);
         }
 
-        // resync occasionally (cheap when MAX_TX is small)
         if (txCount > 0 && txCount % 2 === 0) {
           currentNonce = await resyncNonce(client, account.address, currentNonce);
         }
@@ -1360,13 +1434,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     console.log("ℹ️ No Open lotteries found.");
   }
 
-  // -----------------------------------
-  // 2) Stuck recovery for Drawing state
-  // -----------------------------------
   if (drawingLotteries.length > 0 && txCount < MAX_TX && Date.now() - startTimeMs <= TIME_BUDGET_MS) {
     console.log(`🧯 Found ${drawingLotteries.length} Drawing lotteries to check for hatch.`);
 
-    // fetch isHatchOpen + drawingRequestedAt for safety buffer decision
     const hatchResults = await withRetry(
       () =>
         client.multicall({
@@ -1394,7 +1464,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       const drawingRequestedAt = Number(BigInt(rDrawAt.result as any));
       if (!Number.isFinite(drawingRequestedAt) || drawingRequestedAt <= 0) continue;
 
-      // Wait hatch open (+2h in-contract) + extra buffer
       const ok = nowS > drawingRequestedAt + 2 * 3600 + HATCH_EXTRA_DELAY_SEC;
       if (!ok) {
         const wait = drawingRequestedAt + 2 * 3600 + HATCH_EXTRA_DELAY_SEC - nowS;
@@ -1427,7 +1496,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         continue;
       }
 
-      // throttle hatch attempts
       markAttempt(state, attemptKey);
 
       try {
@@ -1455,7 +1523,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     }
   }
 
-  // Persist state once per run (cheap)
   await saveState(env, state);
 
   console.log(
