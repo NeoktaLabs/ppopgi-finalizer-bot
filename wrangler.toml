@@ -5,13 +5,21 @@ compatibility_date = "2026-02-23"
 # Non-secret env vars (safe in git)
 [vars]
 REGISTRY_ADDRESS = "0xa916e20AbF4d57bCb98f7A845eb74f2EB4Dcbed2"
+DEPLOYER_ADDRESS = "0xYOUR_SINGLE_WINNER_DEPLOYER_ADDRESS_HERE"
+
 RPC_URL = "https://node.mainnet.etherlink.com"
 CRON_EVERY_MINUTES = "3"
+
 MAX_TX = "5"
 TIME_BUDGET_MS = "25000"
 ATTEMPT_TTL_SEC = "600"
 
-# KV binding (you’ll paste the real id after creating KV)
+# Optional sizing / scalability knobs (recommended defaults)
+SAFETY_SCAN_EVERY_RUNS = "30"
+HOT_SIZE = "100"
+COLD_SIZE = "50"
+
+# KV binding
 [[kv_namespaces]]
 binding = "BOT_STATE"
 id = "7be58949d65d4f4d8fa11bab19cbfb0c"
