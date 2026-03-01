@@ -1,7 +1,10 @@
-# wrangler.toml
 name = "ppopgi-finalizer-bot"
 main = "src/BotFinalizeLottery.ts"
 compatibility_date = "2026-02-23"
+
+# 🔁 Run every 1 minute
+[triggers]
+crons = ["* * * * *"]
 
 # Non-secret env vars (safe in git)
 [vars]
@@ -9,44 +12,34 @@ REGISTRY_ADDRESS = "0xa916e20AbF4d57bCb98f7A845eb74f2EB4Dcbed2"
 DEPLOYER_ADDRESS = "0xAd0c8Ba0E4e519B4EA97cE945A20E2716dDbDf7D"
 
 RPC_URL = "https://node.mainnet.etherlink.com"
-
-# cron interval (minutes), used only for the status endpoint countdown
 CRON_EVERY_MINUTES = "1"
 
-# Tx + runtime limits
 MAX_TX = "10"
 TIME_BUDGET_MS = "25000"
 ATTEMPT_TTL_SEC = "600"
 
-# Registry rolling scan sizing
 HOT_SIZE = "200"
 COLD_SIZE = "100"
 
-# Deployer log scan tuning (prevents "Block range is too large")
 LOG_CHUNK_BLOCKS = "250"
 BOOTSTRAP_LOOKBACK_BLOCKS = "50000"
 DEPLOYER_HEAD_LAG_BLOCKS = "2"
 
-# TicketsPurchased sold-out fast-path tuning
 TICKETS_LOOKBACK_BLOCKS = "2500"
 TICKETS_ADDR_CHUNK = "50"
 TICKETS_HEAD_LAG_BLOCKS = "2"
 
-# extra safety buffer BEFORE forceCancelStuck()
 HATCH_EXTRA_DELAY_SEC = "300"
 
-# KV binding
 [[kv_namespaces]]
 binding = "BOT_STATE"
 id = "7be58949d65d4f4d8fa11bab19cbfb0c"
 
-# Durable Object binding
 [durable_objects]
 bindings = [
   { name = "BOT_LOCK", class_name = "BotLockDO" }
 ]
 
-# ✅ Free plan Durable Objects must be created with SQLite-backed classes
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["BotLockDO"]
