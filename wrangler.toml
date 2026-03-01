@@ -11,7 +11,7 @@ RPC_URL = "https://node.mainnet.etherlink.com"
 CRON_EVERY_MINUTES = "1" # you said you might run every 1 min
 
 # Tx + runtime limits
-MAX_TX = "5"
+MAX_TX = "10"
 TIME_BUDGET_MS = "25000"
 ATTEMPT_TTL_SEC = "600"
 
