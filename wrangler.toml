@@ -6,21 +6,31 @@ compatibility_date = "2026-02-23"
 [vars]
 REGISTRY_ADDRESS = "0xa916e20AbF4d57bCb98f7A845eb74f2EB4Dcbed2"
 DEPLOYER_ADDRESS = "0xAd0c8Ba0E4e519B4EA97cE945A20E2716dDbDf7D"
-LOG_CHUNK_BLOCKS = "250"
-BOOTSTRAP_LOOKBACK_BLOCKS = "50000"
-DEPLOYER_HEAD_LAG_BLOCKS = "2"
 
 RPC_URL = "https://node.mainnet.etherlink.com"
-CRON_EVERY_MINUTES = "3"
+CRON_EVERY_MINUTES = "1" # you said you might run every 1 min
 
+# Tx + runtime limits
 MAX_TX = "5"
 TIME_BUDGET_MS = "25000"
 ATTEMPT_TTL_SEC = "600"
 
-# Optional sizing / scalability knobs (recommended defaults)
-SAFETY_SCAN_EVERY_RUNS = "30"
-HOT_SIZE = "100"
-COLD_SIZE = "50"
+# Registry rolling scan sizing
+HOT_SIZE = "200"
+COLD_SIZE = "100"
+
+# Deployer log scan tuning (prevents "Block range is too large")
+LOG_CHUNK_BLOCKS = "250"
+BOOTSTRAP_LOOKBACK_BLOCKS = "50000"
+DEPLOYER_HEAD_LAG_BLOCKS = "2"
+
+# ✅ NEW: TicketsPurchased sold-out fast-path tuning
+# How far back (from head) to scan tickets purchases to catch "just sold out" quickly.
+TICKETS_LOOKBACK_BLOCKS = "2500"
+# How many lottery addresses to include per getLogs(address[]) call.
+TICKETS_ADDR_CHUNK = "50"
+# Head lag to avoid edge cases on reorg / latest block issues.
+TICKETS_HEAD_LAG_BLOCKS = "2"
 
 # KV binding
 [[kv_namespaces]]
