@@ -15,7 +15,7 @@ import { etherlink } from "viem/chains";
 export interface Env {
   BOT_PRIVATE_KEY: string;
 
-  // Registry is still used as a safety net scan (no indexer needed)
+  // Registry is used as a safety net scan (no indexer needed)
   REGISTRY_ADDRESS: string;
 
   // Deployer address for on-chain discovery (no indexer)
@@ -34,13 +34,15 @@ export interface Env {
   // cron interval (minutes), used only for the status endpoint countdown
   CRON_EVERY_MINUTES?: string;
 
-  // optional: run full safety scan every N runs (default 30)
-  SAFETY_SCAN_EVERY_RUNS?: string;
-
   // ✅ Deployer log scan tuning (prevents "Block range is too large")
   LOG_CHUNK_BLOCKS?: string; // default 500 (smaller = safer)
   BOOTSTRAP_LOOKBACK_BLOCKS?: string; // default 50_000
   DEPLOYER_HEAD_LAG_BLOCKS?: string; // default 2
+
+  // ✅ NEW: TicketsPurchased scan tuning for sold-out fast-path
+  TICKETS_LOOKBACK_BLOCKS?: string; // default 2500
+  TICKETS_ADDR_CHUNK?: string; // default 50
+  TICKETS_HEAD_LAG_BLOCKS?: string; // default 2
 }
 
 // -------------------- ABIs --------------------
@@ -71,6 +73,11 @@ const entropyAbi = parseAbi(["function getFeeV2(uint32 callbackGasLimit) externa
 // Deployer event for discovery
 const lotteryDeployedEvent = parseAbiItem(
   "event LotteryDeployed(address indexed lottery,address indexed creator,uint256 winningPot,uint256 ticketPrice,string name,address usdc,address entropy,address entropyProvider,uint32 callbackGasLimit,address feeRecipient,uint256 protocolFeePercent,uint64 deadline,uint64 minTickets,uint64 maxTickets)"
+);
+
+// ✅ TicketsPurchased event for “sold-out fast-path”
+const ticketsPurchasedEvent = parseAbiItem(
+  "event TicketsPurchased(address indexed buyer,uint256 count,uint256 totalCost,uint256 totalSold,uint256 rangeIndex,bool isNewRange)"
 );
 
 // -------------------- HELPERS --------------------
@@ -108,8 +115,8 @@ function parseBigIntOrNull(v: string | null): bigint | null {
   }
 }
 
-function nowSec(): bigint {
-  return BigInt(Math.floor(Date.now() / 1000));
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 function lower(a: string): string {
@@ -236,55 +243,115 @@ async function kvUnlockSafe(env: Env, ttlSec = 10) {
   }
 }
 
-// -------------------- Active set helpers (KV, no indexer) --------------------
+// -------------------- Watchlist State (single KV blob) --------------------
 
-const ACTIVE_PREFIX = "active:"; // active:<lotteryAddrLower> -> "1"
-const DEPLOYER_CURSOR_KEY = "deployer_last_block";
-const RUN_COUNTER_KEY = "run_counter";
+type WatchEntry = {
+  addr: Address;
+  addedAt: number; // unix sec
+  source?: "deployer" | "registry_hot" | "registry_cold";
 
-/** keep actives around long enough for multi-month lotteries */
-const ACTIVE_TTL_SEC = 210 * 24 * 3600; // ~7 months
+  // optional metadata for debugging/UX
+  lastStatus?: number; // 0..4
+  lastCheckedAt?: number; // unix sec
+};
 
-function activeKey(addr: Address) {
-  return `${ACTIVE_PREFIX}${lower(addr)}`;
+type BotStateV1 = {
+  v: 1;
+
+  // addressLower -> entry
+  watch: Record<string, WatchEntry>;
+
+  // throttling: attemptKey -> lastAttempt unix sec
+  attempts: Record<string, number>;
+
+  // cursors
+  deployerCursor?: string; // bigint-as-string
+  registryCursor?: string; // bigint-as-string
+
+  // ✅ NEW: TicketsPurchased log cursor (bigint-as-string)
+  ticketsCursor?: string;
+
+  runCounter: number;
+  updatedAt: number; // unix sec
+};
+
+const STATE_KEY = "state:v1";
+const DEPLOYER_CURSOR_KEY_FALLBACK = "deployer_last_block"; // for migration/visibility only
+const REGISTRY_CURSOR_KEY_FALLBACK = "cursor"; // for migration/visibility only
+const TICKETS_CURSOR_KEY_FALLBACK = "tickets_last_block"; // for migration/visibility only
+
+function emptyState(): BotStateV1 {
+  return { v: 1, watch: {}, attempts: {}, runCounter: 0, updatedAt: nowSec() };
 }
 
-async function addActive(env: Env, addr: Address) {
-  await kvPutSafe(env, activeKey(addr), "1", ACTIVE_TTL_SEC);
+async function loadState(env: Env): Promise<BotStateV1> {
+  const raw = await env.BOT_STATE.get(STATE_KEY);
+  if (!raw) return emptyState();
+  try {
+    const parsed = JSON.parse(raw) as BotStateV1;
+    if (!parsed || parsed.v !== 1) return emptyState();
+    parsed.watch ||= {};
+    parsed.attempts ||= {};
+    parsed.runCounter = Number.isFinite(parsed.runCounter) ? parsed.runCounter : 0;
+    parsed.updatedAt = Number.isFinite(parsed.updatedAt) ? parsed.updatedAt : nowSec();
+    return parsed;
+  } catch {
+    return emptyState();
+  }
 }
 
-async function markInactive(env: Env, addr: Address) {
-  // short tombstone; no delete
-  await kvPutSafe(env, activeKey(addr), "", 6 * 3600);
+async function saveState(env: Env, state: BotStateV1): Promise<void> {
+  state.updatedAt = nowSec();
+  // keep state around long-term
+  await kvPutSafe(env, STATE_KEY, JSON.stringify(state), 365 * 24 * 3600);
+
+  // optional: also keep cursors as standalone keys for visibility/debugging
+  if (state.deployerCursor) await kvPutSafe(env, DEPLOYER_CURSOR_KEY_FALLBACK, state.deployerCursor, 365 * 24 * 3600);
+  if (state.registryCursor) await kvPutSafe(env, REGISTRY_CURSOR_KEY_FALLBACK, state.registryCursor, 365 * 24 * 3600);
+  if (state.ticketsCursor) await kvPutSafe(env, TICKETS_CURSOR_KEY_FALLBACK, state.ticketsCursor, 365 * 24 * 3600);
 }
 
-async function listActive(env: Env, limit = 2000): Promise<Address[]> {
-  const out: Address[] = [];
-  let cursor: string | undefined = undefined;
+function watchKey(addr: Address): string {
+  return lower(addr);
+}
 
-  for (;;) {
-    const res = await env.BOT_STATE.list({ prefix: ACTIVE_PREFIX, cursor, limit: Math.min(1000, limit) });
-    for (const k of res.keys) {
-      const a = k.name.slice(ACTIVE_PREFIX.length);
-      if (a && a.startsWith("0x") && a.length === 42) out.push(a as Address);
-      if (out.length >= limit) return out;
-    }
-    if (!res.list_complete) {
-      cursor = res.cursor;
+function addToWatch(state: BotStateV1, addr: Address, source: WatchEntry["source"], addedAt?: number): boolean {
+  const k = watchKey(addr);
+  if (state.watch[k]) return false;
+  state.watch[k] = {
+    addr,
+    addedAt: addedAt ?? nowSec(),
+    source,
+  };
+  return true;
+}
+
+function removeFromWatch(state: BotStateV1, addr: Address): boolean {
+  const k = watchKey(addr);
+  if (!state.watch[k]) return false;
+  delete state.watch[k];
+  return true;
+}
+
+function pruneAttempts(state: BotStateV1, ttlSec: number) {
+  const t = nowSec();
+  for (const [k, ts] of Object.entries(state.attempts)) {
+    if (!Number.isFinite(ts)) {
+      delete state.attempts[k];
       continue;
     }
-    break;
+    if (t - ts > ttlSec * 2) delete state.attempts[k];
   }
-
-  return out;
 }
 
-async function bumpRunCounter(env: Env): Promise<number> {
-  const raw = await env.BOT_STATE.get(RUN_COUNTER_KEY);
-  const n = raw ? Number(raw) : 0;
-  const next = Number.isFinite(n) ? n + 1 : 1;
-  await kvPutSafe(env, RUN_COUNTER_KEY, String(next), 365 * 24 * 3600);
-  return next;
+function canAttempt(state: BotStateV1, attemptKey: string, ttlSec: number): boolean {
+  const last = state.attempts[attemptKey];
+  if (!last) return true;
+  return nowSec() - last >= ttlSec;
+}
+
+function markAttempt(state: BotStateV1, attemptKey: string) {
+  state.attempts[attemptKey] = nowSec();
 }
 
 // -------------------- Deployer log polling --------------------
@@ -295,12 +362,13 @@ async function bumpRunCounter(env: Env): Promise<number> {
  */
 async function pollDeployerForNewLotteries(
   env: Env,
+  state: BotStateV1,
   client: ReturnType<typeof createPublicClient>,
   startTimeMs: number,
   timeBudgetMs: number
-): Promise<number> {
+): Promise<{ added: Address[]; scannedTo?: bigint }> {
   const deployer = env.DEPLOYER_ADDRESS as Address;
-  if (!deployer || !deployer.startsWith("0x")) return 0;
+  if (!deployer || !deployer.startsWith("0x")) return { added: [] };
 
   const chunkBlocks = BigInt(getSafeInt(env.LOG_CHUNK_BLOCKS, 500, 5000));
   const lookbackBlocks = BigInt(getSafeInt(env.BOOTSTRAP_LOOKBACK_BLOCKS, 50_000, 5_000_000));
@@ -309,15 +377,15 @@ async function pollDeployerForNewLotteries(
   const head = await withRetry(() => client.getBlockNumber(), { tries: 3, baseDelayMs: 250, label: "getBlockNumber" });
   const toBlock = head > headLagBlocks ? head - headLagBlocks : head;
 
-  const lastScanned = parseBigIntOrNull(await env.BOT_STATE.get(DEPLOYER_CURSOR_KEY));
+  const lastScanned = parseBigIntOrNull(state.deployerCursor ?? (await env.BOT_STATE.get(DEPLOYER_CURSOR_KEY_FALLBACK)));
 
   // ✅ Never bootstrap from 0 unless chain head is tiny
   const bootstrapFrom = toBlock > lookbackBlocks ? toBlock - lookbackBlocks : 0n;
 
   let fromBlock = lastScanned != null ? lastScanned + 1n : bootstrapFrom;
-  if (fromBlock > toBlock) return 0;
+  if (fromBlock > toBlock) return { added: [] };
 
-  let added = 0;
+  const newlyAdded: Address[] = [];
   let scannedTo = lastScanned ?? fromBlock - 1n;
 
   while (fromBlock <= toBlock) {
@@ -340,7 +408,6 @@ async function pollDeployerForNewLotteries(
         label: `getLogs LotteryDeployed ${fromBlock}-${end}`,
         isRetryable: (e: any) => {
           const msg = String(e?.shortMessage || e?.message || e);
-          // won't succeed without changing range
           if (msg.toLowerCase().includes("block range is too large")) return false;
           return isTransientErrorMessage(msg);
         },
@@ -349,20 +416,235 @@ async function pollDeployerForNewLotteries(
 
     for (const log of logs) {
       const lottery = (log.args as any)?.lottery as Address | undefined;
-      if (lottery) {
-        await addActive(env, lottery);
-        added++;
-      }
+      if (!lottery) continue;
+      if (addToWatch(state, lottery, "deployer")) newlyAdded.push(lottery);
     }
 
     scannedTo = end;
-    await kvPutSafe(env, DEPLOYER_CURSOR_KEY, String(scannedTo), 365 * 24 * 3600);
+    state.deployerCursor = scannedTo.toString();
 
     fromBlock = end + 1n;
   }
 
-  if (added > 0) console.log(`🧾 Deployer discovery: added ${added} lotteries (cursor=${scannedTo})`);
-  return added;
+  if (newlyAdded.length > 0) {
+    console.log(`🧾 Deployer discovery: added=${newlyAdded.length} (cursor=${scannedTo})`);
+  }
+  return { added: newlyAdded, scannedTo };
+}
+
+// -------------------- Registry rolling scan (every run) --------------------
+
+async function registryRollingScan(
+  env: Env,
+  state: BotStateV1,
+  client: ReturnType<typeof createPublicClient>
+): Promise<{ hotAdded: Address[]; coldAdded: Address[]; total: bigint }> {
+  const HOT_SIZE = getSafeSize(env.HOT_SIZE, 200n, 2000n);
+  const COLD_SIZE = getSafeSize(env.COLD_SIZE, 100n, 2000n);
+
+  const total = await withRetry(
+    () =>
+      client.readContract({
+        address: env.REGISTRY_ADDRESS as Address,
+        abi: registryAbi,
+        functionName: "getAllLotteriesCount",
+      }),
+    { tries: 3, baseDelayMs: 250, label: "getAllLotteriesCount" }
+  );
+
+  const totalBig = BigInt(total as unknown as bigint);
+  if (totalBig === 0n) return { hotAdded: [], coldAdded: [], total: 0n };
+
+  const clampSize = async (start: bigint, limit: bigint): Promise<bigint> => {
+    if (limit <= 0n) return 0n;
+    const [end] = await withRetry(
+      () =>
+        client.readContract({
+          address: env.REGISTRY_ADDRESS as Address,
+          abi: registryAbi,
+          functionName: "getAllLotteriesPageBounds",
+          args: [start, limit],
+        }),
+      { tries: 3, baseDelayMs: 200, label: "getAllLotteriesPageBounds" }
+    );
+    const endBig = BigInt(end as unknown as bigint);
+    if (endBig <= start) return 0n;
+    return endBig - start;
+  };
+
+  const startHot = totalBig > HOT_SIZE ? totalBig - HOT_SIZE : 0n;
+
+  const savedCursorStr = state.registryCursor ?? (await env.BOT_STATE.get(REGISTRY_CURSOR_KEY_FALLBACK));
+  let cursor = savedCursorStr ? BigInt(savedCursorStr) : 0n;
+  if (cursor >= totalBig) cursor = 0n;
+
+  const startCold = cursor;
+
+  const safeHotSize = await clampSize(startHot, HOT_SIZE);
+  const safeColdSize = await clampSize(startCold, COLD_SIZE);
+
+  const [hotBatch, coldBatch] = await withRetry(
+    async () => {
+      const [h, c] = await Promise.all([
+        safeHotSize > 0n
+          ? client.readContract({
+              address: env.REGISTRY_ADDRESS as Address,
+              abi: registryAbi,
+              functionName: "getAllLotteries",
+              args: [startHot, safeHotSize],
+            })
+          : Promise.resolve([] as Address[]),
+        safeColdSize > 0n
+          ? client.readContract({
+              address: env.REGISTRY_ADDRESS as Address,
+              abi: registryAbi,
+              functionName: "getAllLotteries",
+              args: [startCold, safeColdSize],
+            })
+          : Promise.resolve([] as Address[]),
+      ]);
+      return [h as Address[], c as Address[]] as const;
+    },
+    { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
+  );
+
+  // advance cursor
+  let nextCursor = startCold + safeColdSize;
+  if (nextCursor >= totalBig) nextCursor = 0n;
+  state.registryCursor = nextCursor.toString();
+
+  const hotAdded: Address[] = [];
+  for (const a of hotBatch) if (addToWatch(state, a, "registry_hot")) hotAdded.push(a);
+
+  const coldAdded: Address[] = [];
+  for (const a of coldBatch) if (addToWatch(state, a, "registry_cold")) coldAdded.push(a);
+
+  return { hotAdded, coldAdded, total: totalBig };
+}
+
+// -------------------- NEW: Sold-out fast-path via TicketsPurchased logs --------------------
+
+async function pollSoldOutFromTicketsPurchased(
+  env: Env,
+  state: BotStateV1,
+  client: ReturnType<typeof createPublicClient>,
+  startTimeMs: number,
+  timeBudgetMs: number,
+  watchAddrs: Address[]
+): Promise<Address[]> {
+  if (watchAddrs.length === 0) return [];
+
+  // keep this bounded — fast-path is for “near head”
+  const lookback = BigInt(getSafeInt(env.TICKETS_LOOKBACK_BLOCKS, 2500, 250_000));
+  const headLag = BigInt(getSafeInt(env.TICKETS_HEAD_LAG_BLOCKS, 2, 50));
+  const addrChunk = getSafeInt(env.TICKETS_ADDR_CHUNK, 50, 250);
+
+  const chunkBlocks = BigInt(getSafeInt(env.LOG_CHUNK_BLOCKS, 500, 5000));
+
+  const head = await withRetry(() => client.getBlockNumber(), { tries: 3, baseDelayMs: 250, label: "getBlockNumber" });
+  const toBlock = head > headLag ? head - headLag : head;
+
+  // cursor fallback: allows continuity across long downtimes
+  const lastScanned = parseBigIntOrNull(state.ticketsCursor ?? (await env.BOT_STATE.get(TICKETS_CURSOR_KEY_FALLBACK)));
+
+  // default: only scan near-head window
+  const bootstrapFrom = toBlock > lookback ? toBlock - lookback : 0n;
+
+  let fromBlock = lastScanned != null ? lastScanned + 1n : bootstrapFrom;
+
+  // never scan earlier than bootstrapFrom (prevents massive scans if cursor is super old)
+  if (fromBlock < bootstrapFrom) fromBlock = bootstrapFrom;
+
+  if (fromBlock > toBlock) return [];
+
+  // Collect max totalSold observed per lottery address (from event arg totalSold)
+  const soldSeen = new Map<string, bigint>();
+
+  // Chunk addresses to keep getLogs calls manageable
+  const addrChunks = chunkArray(watchAddrs, addrChunk);
+
+  let scannedTo = lastScanned ?? fromBlock - 1n;
+
+  while (fromBlock <= toBlock) {
+    // leave time for finalize/hatch work
+    if (Date.now() - startTimeMs > timeBudgetMs - 4000) break;
+
+    const end = fromBlock + chunkBlocks > toBlock ? toBlock : fromBlock + chunkBlocks;
+
+    for (const addrs of addrChunks) {
+      if (Date.now() - startTimeMs > timeBudgetMs - 3500) break;
+
+      const logs = await withRetry(
+        () =>
+          client.getLogs({
+            address: addrs as Address[],
+            event: ticketsPurchasedEvent,
+            fromBlock,
+            toBlock: end,
+          }),
+        {
+          tries: 3,
+          baseDelayMs: 350,
+          label: `getLogs TicketsPurchased ${fromBlock}-${end} addrs=${addrs.length}`,
+          isRetryable: (e: any) => {
+            const msg = String(e?.shortMessage || e?.message || e);
+            if (msg.toLowerCase().includes("block range is too large")) return false;
+            return isTransientErrorMessage(msg);
+          },
+        }
+      );
+
+      for (const log of logs) {
+        const lotAddr = (log.address as string) || "";
+        if (!lotAddr || !lotAddr.startsWith("0x") || lotAddr.length !== 42) continue;
+
+        const totalSold = BigInt(((log.args as any)?.totalSold ?? 0) as any);
+        const k = lower(lotAddr);
+
+        const prev = soldSeen.get(k);
+        if (prev == null || totalSold > prev) soldSeen.set(k, totalSold);
+      }
+    }
+
+    scannedTo = end;
+    state.ticketsCursor = scannedTo.toString();
+    fromBlock = end + 1n;
+  }
+
+  if (soldSeen.size === 0) return [];
+
+  // Read maxTickets for the lotteries that had ticket events
+  const lots = Array.from(soldSeen.keys()).map((k) => k as Address);
+  const maxTicketsResults = await withRetry(
+    () =>
+      client.multicall({
+        contracts: lots.map((addr) => ({
+          address: addr,
+          abi: lotteryAbi,
+          functionName: "maxTickets",
+        })),
+      }),
+    { tries: 3, baseDelayMs: 250, label: "multicall maxTickets (sold-out scan)" }
+  );
+
+  const urgent: Address[] = [];
+  for (let i = 0; i < lots.length; i++) {
+    const addr = lots[i];
+    const r = maxTicketsResults[i];
+    if (r.status !== "success") continue;
+
+    const maxT = BigInt(r.result as any);
+    if (maxT <= 0n) continue; // no cap => sold-out concept doesn't apply
+
+    const seen = soldSeen.get(lower(addr)) ?? 0n;
+    if (seen >= maxT) urgent.push(addr);
+  }
+
+  if (urgent.length > 0) {
+    console.log(`🚨 Sold-out fast-path: urgent=${urgent.length} (sample=${urgent.slice(0, 10).join(", ")})`);
+  }
+
+  return urgent;
 }
 
 // -------------------- Cron interval utilities (status endpoint only) --------------------
@@ -404,6 +686,69 @@ export default {
 
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
     if (req.method !== "GET") return new Response("Method Not Allowed", { status: 405, headers: cors });
+
+    // --- Debug endpoint: watchlist ---
+    if (url.pathname === "/watchlist") {
+      const state = await loadState(env);
+
+      const start = Math.max(0, Number(url.searchParams.get("start") || "0") | 0);
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit") || "50") | 0));
+
+      const entries = Object.values(state.watch);
+
+      // newest first
+      entries.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+
+      const page = entries.slice(start, start + limit);
+
+      // breakdown by lastStatus for quick debugging
+      const counts: Record<string, number> = { unknown: 0, "0": 0, "1": 0, "2": 0, "3": 0, "4": 0 };
+      for (const e of entries) {
+        if (typeof e.lastStatus !== "number") counts.unknown++;
+        else counts[String(e.lastStatus)] = (counts[String(e.lastStatus)] || 0) + 1;
+      }
+
+      return new Response(
+        JSON.stringify(
+          {
+            total: entries.length,
+            start,
+            limit,
+            countsByStatus: {
+              unknown: counts.unknown,
+              FundingPending: counts["0"],
+              Open: counts["1"],
+              Drawing: counts["2"],
+              Completed: counts["3"],
+              Canceled: counts["4"],
+            },
+            cursors: {
+              deployer: state.deployerCursor ?? null,
+              registry: state.registryCursor ?? null,
+              tickets: state.ticketsCursor ?? null,
+            },
+            items: page.map((e) => ({
+              addr: e.addr,
+              addedAt: e.addedAt,
+              source: e.source || "unknown",
+              lastStatus: typeof e.lastStatus === "number" ? statusLabel(BigInt(e.lastStatus)) : null,
+              lastCheckedAt: e.lastCheckedAt ?? null,
+            })),
+          },
+          null,
+          2
+        ),
+        {
+          headers: {
+            ...cors,
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "public, max-age=2",
+          },
+        }
+      );
+    }
+
+    // --- Existing status endpoint ---
     if (url.pathname !== "/bot-status") return new Response("Not Found", { status: 404, headers: cors });
 
     const [
@@ -417,6 +762,8 @@ export default {
       lastDurationRaw,
       lastTxCountRaw,
       deployerBlockRaw,
+      ticketsBlockRaw,
+      stateRaw,
     ] = await Promise.all([
       env.BOT_STATE.get("last_run_ts"),
       env.BOT_STATE.get("last_run_finished_ts"),
@@ -427,7 +774,9 @@ export default {
       env.BOT_STATE.get("last_run_id"),
       env.BOT_STATE.get("last_run_duration_ms"),
       env.BOT_STATE.get("last_run_tx_count"),
-      env.BOT_STATE.get(DEPLOYER_CURSOR_KEY),
+      env.BOT_STATE.get(DEPLOYER_CURSOR_KEY_FALLBACK),
+      env.BOT_STATE.get(TICKETS_CURSOR_KEY_FALLBACK),
+      env.BOT_STATE.get(STATE_KEY),
     ]);
 
     const now = Date.now();
@@ -442,6 +791,22 @@ export default {
 
     const lockVal = (lock || "").trim();
     const running = lockVal.length > 0;
+
+    let watchCount: number | null = null;
+    let deployerCursorFromState: string | null = null;
+    let registryCursorFromState: string | null = null;
+    let ticketsCursorFromState: string | null = null;
+    try {
+      if (stateRaw) {
+        const s = JSON.parse(stateRaw) as BotStateV1;
+        watchCount = s?.watch ? Object.keys(s.watch).length : null;
+        deployerCursorFromState = s?.deployerCursor ?? null;
+        registryCursorFromState = s?.registryCursor ?? null;
+        ticketsCursorFromState = s?.ticketsCursor ?? null;
+      }
+    } catch {
+      // ignore
+    }
 
     return new Response(
       JSON.stringify(
@@ -466,6 +831,13 @@ export default {
           lastError: lastError && lastError.trim() ? lastError : null,
 
           deployerCursorBlock: deployerBlockRaw ? Number(deployerBlockRaw) : null,
+          ticketsCursorBlock: ticketsBlockRaw ? Number(ticketsBlockRaw) : null,
+
+          // helpful debug signals
+          watchlistCount: watchCount,
+          deployerCursorFromState,
+          registryCursorFromState,
+          ticketsCursorFromState,
         },
         null,
         2
@@ -570,102 +942,61 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const TIME_BUDGET_MS = getSafeInt(env.TIME_BUDGET_MS, 25_000, 45_000);
   const ATTEMPT_TTL_SEC = getSafeInt(env.ATTEMPT_TTL_SEC, 600, 3600);
 
-  // (A) On-chain discovery (Deployer logs) — no indexer
-  await pollDeployerForNewLotteries(env, client, startTimeMs, TIME_BUDGET_MS);
+  const state = await loadState(env);
+  state.runCounter += 1;
 
-  // (B) Active-set processing
-  const actives = await listActive(env, 2500);
+  pruneAttempts(state, ATTEMPT_TTL_SEC);
 
-  // (C) Safety scan occasionally (registry cursor) — belt & suspenders
-  const runNo = await bumpRunCounter(env);
-  const safetyEvery = getSafeInt(env.SAFETY_SCAN_EVERY_RUNS, 30, 500);
-  const doSafetyScan = runNo % safetyEvery === 0;
+  // -----------------------------
+  // (A) Discovery -> watchlist
+  // -----------------------------
+  const beforeWatchCount = Object.keys(state.watch).length;
 
-  let safetyCandidates: Address[] = [];
-  if (doSafetyScan) {
-    console.log(`🛟 Safety scan enabled this run (every ${safetyEvery} runs)`);
+  const dep = await pollDeployerForNewLotteries(env, state, client, startTimeMs, TIME_BUDGET_MS);
 
-    const HOT_SIZE = getSafeSize(env.HOT_SIZE, 100n, 500n);
-    const COLD_SIZE = getSafeSize(env.COLD_SIZE, 50n, 200n);
+  // Registry rolling scan EVERY RUN (hot tail + cold cursor)
+  const reg = await registryRollingScan(env, state, client);
 
-    const total = await withRetry(
-      () =>
-        client.readContract({
-          address: env.REGISTRY_ADDRESS as Address,
-          abi: registryAbi,
-          functionName: "getAllLotteriesCount",
-        }),
-      { tries: 3, baseDelayMs: 250, label: "getAllLotteriesCount" }
+  const afterDiscoveryCount = Object.keys(state.watch).length;
+
+  // Nice delta logging (capped)
+  const addedAll = [...dep.added, ...reg.hotAdded, ...reg.coldAdded];
+  if (addedAll.length > 0) {
+    const sample = addedAll.slice(0, 10);
+    console.log(
+      `📌 Watchlist discovery: added=${addedAll.length} (sample=${sample.join(", ")}) watchlist=${afterDiscoveryCount}`
     );
-
-    if (total > 0n) {
-      const clampSize = async (start: bigint, limit: bigint): Promise<bigint> => {
-        if (limit <= 0n) return 0n;
-        const [end] = await withRetry(
-          () =>
-            client.readContract({
-              address: env.REGISTRY_ADDRESS as Address,
-              abi: registryAbi,
-              functionName: "getAllLotteriesPageBounds",
-              args: [start, limit],
-            }),
-          { tries: 3, baseDelayMs: 200, label: "getAllLotteriesPageBounds" }
-        );
-        const endBig = BigInt(end as unknown as bigint);
-        if (endBig <= start) return 0n;
-        return endBig - start;
-      };
-
-      const startHot = total > HOT_SIZE ? total - HOT_SIZE : 0n;
-
-      const savedCursor = await env.BOT_STATE.get("cursor");
-      let cursor = savedCursor ? BigInt(savedCursor) : 0n;
-      if (cursor >= total) cursor = 0n;
-
-      const startCold = cursor;
-
-      const safeHotSize = await clampSize(startHot, HOT_SIZE);
-      const safeColdSize = await clampSize(startCold, COLD_SIZE);
-
-      const [hotBatch, coldBatch] = await withRetry(
-        async () => {
-          const [h, c] = await Promise.all([
-            safeHotSize > 0n
-              ? client.readContract({
-                  address: env.REGISTRY_ADDRESS as Address,
-                  abi: registryAbi,
-                  functionName: "getAllLotteries",
-                  args: [startHot, safeHotSize],
-                })
-              : Promise.resolve([] as Address[]),
-            safeColdSize > 0n
-              ? client.readContract({
-                  address: env.REGISTRY_ADDRESS as Address,
-                  abi: registryAbi,
-                  functionName: "getAllLotteries",
-                  args: [startCold, safeColdSize],
-                })
-              : Promise.resolve([] as Address[]),
-          ]);
-          return [h, c] as const;
-        },
-        { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
-      );
-
-      let nextCursor = startCold + safeColdSize;
-      if (nextCursor >= total) nextCursor = 0n;
-      await kvPutSafe(env, "cursor", nextCursor.toString(), 365 * 24 * 3600);
-
-      safetyCandidates = Array.from(new Set([...(hotBatch as Address[]), ...(coldBatch as Address[])]));
-      console.log(`🛟 Safety candidates=${safetyCandidates.length}`);
-    }
+  } else {
+    console.log(`📌 Watchlist discovery: added=0 watchlist=${afterDiscoveryCount}`);
   }
 
-  const candidates = Array.from(new Set([...actives, ...safetyCandidates]));
+  // Candidates = watchlist (bounded)
+  const watchEntries = Object.values(state.watch);
+
+  // If huge, bound how many we try to status-check per run
+  const MAX_WATCH_CHECK = 3000;
+  const candidates: Address[] = watchEntries
+    .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
+    .slice(0, MAX_WATCH_CHECK)
+    .map((e) => e.addr);
+
   if (candidates.length === 0) {
-    console.log("ℹ️ No active candidates. Done.");
+    console.log("ℹ️ Watchlist is empty. Done.");
+    await saveState(env, state);
     return 0;
   }
+
+  // -----------------------------
+  // (B) SOLD-OUT FAST-PATH (tickets logs near head)
+  // -----------------------------
+  const urgentSoldOut = await pollSoldOutFromTicketsPurchased(
+    env,
+    state,
+    client,
+    startTimeMs,
+    TIME_BUDGET_MS,
+    candidates // scanning the bounded set keeps RPC predictable
+  );
 
   // status multicall
   const statusResults = await withRetry(
@@ -684,24 +1015,44 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const drawingLotteries: Address[] = [];
   const doneLotteries: Address[] = [];
 
+  // update lastStatus + lastCheckedAt for debug endpoint
+  const tNow = nowSec();
+
   for (let i = 0; i < candidates.length; i++) {
     const addr = candidates[i];
     const r = statusResults[i];
-
     if (r.status !== "success") continue;
 
-    const s = BigInt(r.result as bigint);
-    console.log(`🔎 ${addr} status=${statusLabel(s)}`);
+    const s = Number(BigInt(r.result as bigint));
+    const wk = watchKey(addr);
+    if (state.watch[wk]) {
+      state.watch[wk].lastStatus = s;
+      state.watch[wk].lastCheckedAt = tNow;
+    }
 
-    if (s === 1n) openLotteries.push(addr);
-    else if (s === 2n) drawingLotteries.push(addr);
-    else if (s === 3n || s === 4n) doneLotteries.push(addr);
+    if (s === 1) openLotteries.push(addr);
+    else if (s === 2) drawingLotteries.push(addr);
+    else if (s === 3 || s === 4) doneLotteries.push(addr);
   }
 
-  // remove completed/canceled from active set (no delete)
+  // prune completed/canceled from watchlist
+  const removed: Address[] = [];
   for (const d of doneLotteries) {
-    await markInactive(env, d);
+    if (removeFromWatch(state, d)) removed.push(d);
   }
+
+  if (removed.length > 0) {
+    console.log(
+      `🧹 Watchlist prune: removed=${removed.length} (sample=${removed.slice(0, 10).join(", ")}) watchlist=${
+        Object.keys(state.watch).length
+      }`
+    );
+  }
+
+  // Helpful summary log
+  console.log(
+    `📊 Watchlist summary: total=${Object.keys(state.watch).length} checked=${candidates.length} open=${openLotteries.length} drawing=${drawingLotteries.length} done=${doneLotteries.length} (before=${beforeWatchCount}, afterDiscovery=${afterDiscoveryCount})`
+  );
 
   const currentNonceStart = await withRetry(
     () => client.getTransactionCount({ address: account.address, blockTag: "pending" }),
@@ -713,16 +1064,26 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
   // -----------------------------
   // 1) Finalize Open lotteries
+  //    ✅ Urgent sold-out first
   // -----------------------------
   if (openLotteries.length > 0) {
-    console.log(`⚡ Found ${openLotteries.length} Open lotteries to analyze.`);
-    const chunks = chunkArray(openLotteries, 25);
+    const urgentSet = new Set(urgentSoldOut.map((a) => lower(a)));
+    const urgentOpen = openLotteries.filter((a) => urgentSet.has(lower(a)));
+    const normalOpen = openLotteries.filter((a) => !urgentSet.has(lower(a)));
+
+    const orderedOpen = [...urgentOpen, ...normalOpen];
+
+    console.log(
+      `⚡ Open lotteries: total=${openLotteries.length} urgentSoldOutOpen=${urgentOpen.length} normalOpen=${normalOpen.length}`
+    );
+
+    const chunks = chunkArray(orderedOpen, 25);
 
     for (const chunk of chunks) {
       if (txCount >= MAX_TX) break;
       if (Date.now() - startTimeMs > TIME_BUDGET_MS) break;
 
-      const tNow = nowSec();
+      const tNowSec = BigInt(nowSec());
 
       const detailCalls = chunk.flatMap((addr) => [
         { address: addr, abi: lotteryAbi, functionName: "deadline" },
@@ -790,7 +1151,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         const entropyAddr = rEntropy.result as Address;
         const callbackGasLimit = Number(BigInt(rGas.result as any));
 
-        const isExpired = tNow >= deadline;
+        const isExpired = tNowSec >= deadline;
         const isFull = maxTickets > 0n && sold >= maxTickets;
         if (!isExpired && !isFull) continue;
 
@@ -812,18 +1173,24 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       }
 
       if (actionable.length === 0) continue;
-      actionable.sort((a, b) => b.score - a.score);
+
+      // If sold-out urgent was detected, bump it to the top within this batch.
+      actionable.sort((a, b) => {
+        const au = urgentSet.has(lower(a.addr)) ? 1 : 0;
+        const bu = urgentSet.has(lower(b.addr)) ? 1 : 0;
+        if (au !== bu) return bu - au;
+        return b.score - a.score;
+      });
 
       for (const c of actionable) {
         if (txCount >= MAX_TX) break;
         if (Date.now() - startTimeMs > TIME_BUDGET_MS) break;
 
-        const attemptKey = `attempt:finalize:${lower(c.addr)}`;
-        const recentAttempt = await env.BOT_STATE.get(attemptKey);
-        if (recentAttempt) continue;
+        const attemptKey = `finalize:${lower(c.addr)}`;
+        if (!canAttempt(state, attemptKey, ATTEMPT_TTL_SEC)) continue;
 
         console.log(
-          `🚀 Finalize candidate: ${c.addr} (expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath} gas=${c.callbackGasLimit})`
+          `🚀 Finalize candidate: ${c.addr} (urgent=${urgentSet.has(lower(c.addr))} expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath} gas=${c.callbackGasLimit})`
         );
 
         const fetchFeeV2 = async (useCache: boolean): Promise<bigint> => {
@@ -862,7 +1229,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           } catch (e: any) {
             const msg = (e?.shortMessage || e?.message || "").toString();
             console.warn(`   ⚠️ FeeV2 lookup failed; skipping draw for now: ${msg}`);
-            await kvPutSafe(env, attemptKey, `feeFail:${Date.now()}`, Math.min(300, ATTEMPT_TTL_SEC));
+            markAttempt(state, attemptKey);
             continue;
           }
         }
@@ -904,15 +1271,14 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
             }
 
             console.warn(`   ⏭️ Simulation revert: ${msg}`);
-            const ttl = (!c.cancelPath && isWrongEntropyFeeMessage(msg)) ? 60 : Math.min(120, ATTEMPT_TTL_SEC);
-            await kvPutSafe(env, attemptKey, `revert:${Date.now()}`, ttl);
             break;
           }
         }
 
-        if (!simulated) continue;
+        // throttle regardless (prevents spam)
+        markAttempt(state, attemptKey);
 
-        await kvPutSafe(env, attemptKey, `${Date.now()}`, ATTEMPT_TTL_SEC);
+        if (!simulated) continue;
 
         try {
           const nonceToUse = currentNonce;
@@ -930,14 +1296,11 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           );
 
           currentNonce++;
-          console.log(`   ✅ Tx Sent: ${hash}`);
+          console.log(`   ✅ finalize Tx Sent: ${hash}`);
           txCount++;
-
-          // keep it active (refresh TTL) — in case more checks needed for hatch
-          await addActive(env, c.addr);
         } catch (e: any) {
           const msg = (e?.shortMessage || e?.message || "").toString();
-          console.warn(`   ⏭️ Tx failed: ${msg}`);
+          console.warn(`   ⏭️ finalize Tx failed: ${msg}`);
         }
       }
     }
@@ -972,8 +1335,8 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       if (r.status !== "success") continue;
       if (r.result !== true) continue;
 
-      const attemptKey = `attempt:hatch:${lower(addr)}`;
-      if (await env.BOT_STATE.get(attemptKey)) continue;
+      const attemptKey = `hatch:${lower(addr)}`;
+      if (!canAttempt(state, attemptKey, ATTEMPT_TTL_SEC)) continue;
 
       console.log(`🧯 Hatch open: ${addr} -> forceCancelStuck()`);
 
@@ -991,11 +1354,11 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ Hatch simulation revert: ${msg}`);
-        await kvPutSafe(env, attemptKey, `revert:${Date.now()}`, Math.min(300, ATTEMPT_TTL_SEC));
+        markAttempt(state, attemptKey);
         continue;
       }
 
-      await kvPutSafe(env, attemptKey, `${Date.now()}`, ATTEMPT_TTL_SEC);
+      markAttempt(state, attemptKey);
 
       try {
         const nonceToUse = currentNonce;
@@ -1014,9 +1377,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         currentNonce++;
         console.log(`   ✅ forceCancelStuck Tx Sent: ${hash}`);
         txCount++;
-
-        // keep active TTL fresh so we keep watching until status updates to Canceled
-        await addActive(env, addr);
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ forceCancelStuck Tx failed: ${msg}`);
@@ -1024,6 +1384,11 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     }
   }
 
-  console.log(`🏁 Run complete. txCount=${txCount} actives=${actives.length} candidates=${candidates.length}`);
+  // Persist state once per run (cheap)
+  await saveState(env, state);
+
+  console.log(
+    `🏁 Run complete. txCount=${txCount} watchlist=${Object.keys(state.watch).length} checked=${candidates.length} urgentSoldOut=${urgentSoldOut.length}`
+  );
   return txCount;
 }
