@@ -18,7 +18,7 @@ export interface Env {
   // Registry is still used as a safety net scan (no indexer needed)
   REGISTRY_ADDRESS: string;
 
-  // ✅ NEW: Deployer address for on-chain discovery (no indexer)
+  // Deployer address for on-chain discovery (no indexer)
   DEPLOYER_ADDRESS: string;
 
   RPC_URL?: string;
@@ -31,11 +31,16 @@ export interface Env {
   TIME_BUDGET_MS?: string;
   ATTEMPT_TTL_SEC?: string;
 
-  // ✅ cron interval (minutes), used only for the status endpoint countdown
+  // cron interval (minutes), used only for the status endpoint countdown
   CRON_EVERY_MINUTES?: string;
 
-  // ✅ optional: run full safety scan every N runs (default 30)
+  // optional: run full safety scan every N runs (default 30)
   SAFETY_SCAN_EVERY_RUNS?: string;
+
+  // ✅ Deployer log scan tuning (prevents "Block range is too large")
+  LOG_CHUNK_BLOCKS?: string; // default 500 (smaller = safer)
+  BOOTSTRAP_LOOKBACK_BLOCKS?: string; // default 50_000
+  DEPLOYER_HEAD_LAG_BLOCKS?: string; // default 2
 }
 
 // -------------------- ABIs --------------------
@@ -63,7 +68,7 @@ const lotteryAbi = parseAbi([
 
 const entropyAbi = parseAbi(["function getFeeV2(uint32 callbackGasLimit) external view returns (uint256)"]);
 
-// ✅ Deployer event for discovery
+// Deployer event for discovery
 const lotteryDeployedEvent = parseAbiItem(
   "event LotteryDeployed(address indexed lottery,address indexed creator,uint256 winningPot,uint256 ticketPrice,string name,address usdc,address entropy,address entropyProvider,uint32 callbackGasLimit,address feeRecipient,uint256 protocolFeePercent,uint64 deadline,uint64 minTickets,uint64 maxTickets)"
 );
@@ -94,6 +99,15 @@ function getSafeInt(val: string | undefined, defaultVal: number, maxVal: number)
   return Math.min(Math.max(0, Math.floor(n)), maxVal);
 }
 
+function parseBigIntOrNull(v: string | null): bigint | null {
+  if (!v) return null;
+  try {
+    return BigInt(v);
+  } catch {
+    return null;
+  }
+}
+
 function nowSec(): bigint {
   return BigInt(Math.floor(Date.now() / 1000));
 }
@@ -119,6 +133,7 @@ function isTransientErrorMessage(msg: string): boolean {
   );
 }
 
+// Try to detect your custom error name from viem messages (best effort).
 function isWrongEntropyFeeMessage(msg: string): boolean {
   const m = msg.toLowerCase();
   return m.includes("wrongentropyfee") || (m.includes("wrong") && m.includes("entropy") && m.includes("fee"));
@@ -235,7 +250,6 @@ function activeKey(addr: Address) {
 }
 
 async function addActive(env: Env, addr: Address) {
-  // value is small; TTL keeps KV clean over time
   await kvPutSafe(env, activeKey(addr), "1", ACTIVE_TTL_SEC);
 }
 
@@ -251,7 +265,6 @@ async function listActive(env: Env, limit = 2000): Promise<Address[]> {
   for (;;) {
     const res = await env.BOT_STATE.list({ prefix: ACTIVE_PREFIX, cursor, limit: Math.min(1000, limit) });
     for (const k of res.keys) {
-      // key format: active:0xabc...
       const a = k.name.slice(ACTIVE_PREFIX.length);
       if (a && a.startsWith("0x") && a.length === 42) out.push(a as Address);
       if (out.length >= limit) return out;
@@ -278,31 +291,40 @@ async function bumpRunCounter(env: Env): Promise<number> {
 
 /**
  * Discover newly created lotteries from the Deployer event log.
- * This makes the bot indexer-independent and "ASAP".
+ * Chunked to avoid RPC "Block range is too large".
  */
 async function pollDeployerForNewLotteries(
   env: Env,
-  client: ReturnType<typeof createPublicClient>
+  client: ReturnType<typeof createPublicClient>,
+  startTimeMs: number,
+  timeBudgetMs: number
 ): Promise<number> {
   const deployer = env.DEPLOYER_ADDRESS as Address;
   if (!deployer || !deployer.startsWith("0x")) return 0;
 
-  // keep a small head lag just in case of reorgs
+  const chunkBlocks = BigInt(getSafeInt(env.LOG_CHUNK_BLOCKS, 500, 5000));
+  const lookbackBlocks = BigInt(getSafeInt(env.BOOTSTRAP_LOOKBACK_BLOCKS, 50_000, 5_000_000));
+  const headLagBlocks = BigInt(getSafeInt(env.DEPLOYER_HEAD_LAG_BLOCKS, 2, 50));
+
   const head = await withRetry(() => client.getBlockNumber(), { tries: 3, baseDelayMs: 250, label: "getBlockNumber" });
-  const SAFE_HEAD_LAG = 2n;
-  const toBlock = head > SAFE_HEAD_LAG ? head - SAFE_HEAD_LAG : head;
+  const toBlock = head > headLagBlocks ? head - headLagBlocks : head;
 
-  const lastRaw = await env.BOT_STATE.get(DEPLOYER_CURSOR_KEY);
-  let fromBlock = lastRaw ? BigInt(lastRaw) + 1n : 0n;
+  const lastScanned = parseBigIntOrNull(await env.BOT_STATE.get(DEPLOYER_CURSOR_KEY));
 
+  // ✅ Never bootstrap from 0 unless chain head is tiny
+  const bootstrapFrom = toBlock > lookbackBlocks ? toBlock - lookbackBlocks : 0n;
+
+  let fromBlock = lastScanned != null ? lastScanned + 1n : bootstrapFrom;
   if (fromBlock > toBlock) return 0;
 
-  // Bound log range per request to avoid huge RPC responses
-  const MAX_RANGE = 10_000n;
   let added = 0;
+  let scannedTo = lastScanned ?? fromBlock - 1n;
 
   while (fromBlock <= toBlock) {
-    const end = fromBlock + MAX_RANGE > toBlock ? toBlock : fromBlock + MAX_RANGE;
+    // leave time for finalize/hatch work
+    if (Date.now() - startTimeMs > timeBudgetMs - 2000) break;
+
+    const end = fromBlock + chunkBlocks > toBlock ? toBlock : fromBlock + chunkBlocks;
 
     const logs = await withRetry(
       () =>
@@ -312,7 +334,17 @@ async function pollDeployerForNewLotteries(
           fromBlock,
           toBlock: end,
         }),
-      { tries: 3, baseDelayMs: 350, label: `getLogs LotteryDeployed ${fromBlock}-${end}` }
+      {
+        tries: 3,
+        baseDelayMs: 350,
+        label: `getLogs LotteryDeployed ${fromBlock}-${end}`,
+        isRetryable: (e: any) => {
+          const msg = String(e?.shortMessage || e?.message || e);
+          // won't succeed without changing range
+          if (msg.toLowerCase().includes("block range is too large")) return false;
+          return isTransientErrorMessage(msg);
+        },
+      }
     );
 
     for (const log of logs) {
@@ -323,12 +355,13 @@ async function pollDeployerForNewLotteries(
       }
     }
 
-    // advance cursor to end (best effort)
-    await kvPutSafe(env, DEPLOYER_CURSOR_KEY, String(end), 365 * 24 * 3600);
+    scannedTo = end;
+    await kvPutSafe(env, DEPLOYER_CURSOR_KEY, String(scannedTo), 365 * 24 * 3600);
+
     fromBlock = end + 1n;
   }
 
-  if (added > 0) console.log(`🧾 Deployer discovery: added ${added} lotteries to active set`);
+  if (added > 0) console.log(`🧾 Deployer discovery: added ${added} lotteries (cursor=${scannedTo})`);
   return added;
 }
 
@@ -432,7 +465,6 @@ export default {
           secondsToNextRun: Math.max(0, Math.floor((nextRun - now) / 1000)),
           lastError: lastError && lastError.trim() ? lastError : null,
 
-          // helpful for debugging discovery
           deployerCursorBlock: deployerBlockRaw ? Number(deployerBlockRaw) : null,
         },
         null,
@@ -455,12 +487,11 @@ export default {
 
     console.log(`🤖 Run ${runId} started`);
 
-    // Run markers early (best effort)
     await kvPutSafe(env, "last_run_ts", START_TIME.toString());
     await kvPutSafe(env, "last_run_status", "running");
     await kvPutSafe(env, "last_run_id", runId);
 
-    // ✅ NO deletes — clear via short-lived sentinels
+    // NO deletes — clear via short-lived sentinels
     await kvClearSafe(env, "last_run_error", 120);
     await kvClearSafe(env, "last_run_duration_ms", 120);
     await kvClearSafe(env, "last_run_tx_count", 120);
@@ -540,7 +571,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const ATTEMPT_TTL_SEC = getSafeInt(env.ATTEMPT_TTL_SEC, 600, 3600);
 
   // (A) On-chain discovery (Deployer logs) — no indexer
-  await pollDeployerForNewLotteries(env, client);
+  await pollDeployerForNewLotteries(env, client, startTimeMs, TIME_BUDGET_MS);
 
   // (B) Active-set processing
   const actives = await listActive(env, 2500);
@@ -984,8 +1015,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         console.log(`   ✅ forceCancelStuck Tx Sent: ${hash}`);
         txCount++;
 
-        // likely ends the lottery; we'll drop it next run when status updates,
-        // but keep active TTL fresh so we keep watching.
+        // keep active TTL fresh so we keep watching until status updates to Canceled
         await addActive(env, addr);
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
