@@ -4,6 +4,7 @@ import {
   createWalletClient,
   http,
   parseAbi,
+  parseAbiItem,
   type Hex,
   type Address,
 } from "viem";
@@ -13,7 +14,13 @@ import { etherlink } from "viem/chains";
 // --- TYPES & INTERFACES ---
 export interface Env {
   BOT_PRIVATE_KEY: string;
+
+  // Registry is still used as a safety net scan (no indexer needed)
   REGISTRY_ADDRESS: string;
+
+  // ✅ NEW: Deployer address for on-chain discovery (no indexer)
+  DEPLOYER_ADDRESS: string;
+
   RPC_URL?: string;
   BOT_STATE: KVNamespace;
 
@@ -26,9 +33,13 @@ export interface Env {
 
   // ✅ cron interval (minutes), used only for the status endpoint countdown
   CRON_EVERY_MINUTES?: string;
+
+  // ✅ optional: run full safety scan every N runs (default 30)
+  SAFETY_SCAN_EVERY_RUNS?: string;
 }
 
-// ABIs
+// -------------------- ABIs --------------------
+
 const registryAbi = parseAbi([
   "function getAllLotteriesCount() external view returns (uint256)",
   "function getAllLotteries(uint256 start, uint256 limit) external view returns (address[])",
@@ -50,11 +61,15 @@ const lotteryAbi = parseAbi([
   "function forceCancelStuck() external",
 ]);
 
-const entropyAbi = parseAbi([
-  "function getFeeV2(uint32 callbackGasLimit) external view returns (uint256)",
-]);
+const entropyAbi = parseAbi(["function getFeeV2(uint32 callbackGasLimit) external view returns (uint256)"]);
 
-// --- HELPERS ---
+// ✅ Deployer event for discovery
+const lotteryDeployedEvent = parseAbiItem(
+  "event LotteryDeployed(address indexed lottery,address indexed creator,uint256 winningPot,uint256 ticketPrice,string name,address usdc,address entropy,address entropyProvider,uint32 callbackGasLimit,address feeRecipient,uint256 protocolFeePercent,uint64 deadline,uint64 minTickets,uint64 maxTickets)"
+);
+
+// -------------------- HELPERS --------------------
+
 function chunkArray<T>(array: T[], size: number): T[][] {
   const result: T[][] = [];
   for (let i = 0; i < array.length; i += size) result.push(array.slice(i, i + size));
@@ -109,6 +124,7 @@ function isWrongEntropyFeeMessage(msg: string): boolean {
   return m.includes("wrongentropyfee") || (m.includes("wrong") && m.includes("entropy") && m.includes("fee"));
 }
 
+// Prioritization: sold-out first, then expired with sold>0, then expired sold==0
 function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): number {
   if (isFull) return 3;
   if (isExpired && sold > 0n) return 2;
@@ -116,6 +132,7 @@ function priorityScore(isFull: boolean, isExpired: boolean, sold: bigint): numbe
   return 0;
 }
 
+// map status number to label (your Solidity enum order)
 function statusLabel(s: bigint): string {
   switch (s) {
     case 0n:
@@ -195,7 +212,6 @@ async function kvClearSafe(env: Env, key: string, ttlSec = 120) {
 /**
  * ✅ "Unlock" without delete:
  * - set lock value to empty with very short TTL
- * - lock TTL is still the ultimate safety
  */
 async function kvUnlockSafe(env: Env, ttlSec = 10) {
   try {
@@ -205,7 +221,119 @@ async function kvUnlockSafe(env: Env, ttlSec = 10) {
   }
 }
 
-// ✅ cron interval utilities (for accurate countdown in UI)
+// -------------------- Active set helpers (KV, no indexer) --------------------
+
+const ACTIVE_PREFIX = "active:"; // active:<lotteryAddrLower> -> "1"
+const DEPLOYER_CURSOR_KEY = "deployer_last_block";
+const RUN_COUNTER_KEY = "run_counter";
+
+/** keep actives around long enough for multi-month lotteries */
+const ACTIVE_TTL_SEC = 210 * 24 * 3600; // ~7 months
+
+function activeKey(addr: Address) {
+  return `${ACTIVE_PREFIX}${lower(addr)}`;
+}
+
+async function addActive(env: Env, addr: Address) {
+  // value is small; TTL keeps KV clean over time
+  await kvPutSafe(env, activeKey(addr), "1", ACTIVE_TTL_SEC);
+}
+
+async function markInactive(env: Env, addr: Address) {
+  // short tombstone; no delete
+  await kvPutSafe(env, activeKey(addr), "", 6 * 3600);
+}
+
+async function listActive(env: Env, limit = 2000): Promise<Address[]> {
+  const out: Address[] = [];
+  let cursor: string | undefined = undefined;
+
+  for (;;) {
+    const res = await env.BOT_STATE.list({ prefix: ACTIVE_PREFIX, cursor, limit: Math.min(1000, limit) });
+    for (const k of res.keys) {
+      // key format: active:0xabc...
+      const a = k.name.slice(ACTIVE_PREFIX.length);
+      if (a && a.startsWith("0x") && a.length === 42) out.push(a as Address);
+      if (out.length >= limit) return out;
+    }
+    if (!res.list_complete) {
+      cursor = res.cursor;
+      continue;
+    }
+    break;
+  }
+
+  return out;
+}
+
+async function bumpRunCounter(env: Env): Promise<number> {
+  const raw = await env.BOT_STATE.get(RUN_COUNTER_KEY);
+  const n = raw ? Number(raw) : 0;
+  const next = Number.isFinite(n) ? n + 1 : 1;
+  await kvPutSafe(env, RUN_COUNTER_KEY, String(next), 365 * 24 * 3600);
+  return next;
+}
+
+// -------------------- Deployer log polling --------------------
+
+/**
+ * Discover newly created lotteries from the Deployer event log.
+ * This makes the bot indexer-independent and "ASAP".
+ */
+async function pollDeployerForNewLotteries(
+  env: Env,
+  client: ReturnType<typeof createPublicClient>
+): Promise<number> {
+  const deployer = env.DEPLOYER_ADDRESS as Address;
+  if (!deployer || !deployer.startsWith("0x")) return 0;
+
+  // keep a small head lag just in case of reorgs
+  const head = await withRetry(() => client.getBlockNumber(), { tries: 3, baseDelayMs: 250, label: "getBlockNumber" });
+  const SAFE_HEAD_LAG = 2n;
+  const toBlock = head > SAFE_HEAD_LAG ? head - SAFE_HEAD_LAG : head;
+
+  const lastRaw = await env.BOT_STATE.get(DEPLOYER_CURSOR_KEY);
+  let fromBlock = lastRaw ? BigInt(lastRaw) + 1n : 0n;
+
+  if (fromBlock > toBlock) return 0;
+
+  // Bound log range per request to avoid huge RPC responses
+  const MAX_RANGE = 10_000n;
+  let added = 0;
+
+  while (fromBlock <= toBlock) {
+    const end = fromBlock + MAX_RANGE > toBlock ? toBlock : fromBlock + MAX_RANGE;
+
+    const logs = await withRetry(
+      () =>
+        client.getLogs({
+          address: deployer,
+          event: lotteryDeployedEvent,
+          fromBlock,
+          toBlock: end,
+        }),
+      { tries: 3, baseDelayMs: 350, label: `getLogs LotteryDeployed ${fromBlock}-${end}` }
+    );
+
+    for (const log of logs) {
+      const lottery = (log.args as any)?.lottery as Address | undefined;
+      if (lottery) {
+        await addActive(env, lottery);
+        added++;
+      }
+    }
+
+    // advance cursor to end (best effort)
+    await kvPutSafe(env, DEPLOYER_CURSOR_KEY, String(end), 365 * 24 * 3600);
+    fromBlock = end + 1n;
+  }
+
+  if (added > 0) console.log(`🧾 Deployer discovery: added ${added} lotteries to active set`);
+  return added;
+}
+
+// -------------------- Cron interval utilities (status endpoint only) --------------------
+
 function getCronEveryMinutes(env: Env): number {
   const raw = env.CRON_EVERY_MINUTES;
   const n = Number(raw);
@@ -234,22 +362,16 @@ function corsHeadersFor(req: Request): Record<string, string> {
   };
 }
 
-// --- MAIN WORKER ---
+// -------------------- MAIN WORKER --------------------
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const cors = corsHeadersFor(req);
 
-    if (req.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: cors });
-    }
-
-    if (req.method !== "GET") {
-      return new Response("Method Not Allowed", { status: 405, headers: cors });
-    }
-    if (url.pathname !== "/bot-status") {
-      return new Response("Not Found", { status: 404, headers: cors });
-    }
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    if (req.method !== "GET") return new Response("Method Not Allowed", { status: 405, headers: cors });
+    if (url.pathname !== "/bot-status") return new Response("Not Found", { status: 404, headers: cors });
 
     const [
       lastRunTsRaw,
@@ -261,6 +383,7 @@ export default {
       lastRunId,
       lastDurationRaw,
       lastTxCountRaw,
+      deployerBlockRaw,
     ] = await Promise.all([
       env.BOT_STATE.get("last_run_ts"),
       env.BOT_STATE.get("last_run_finished_ts"),
@@ -271,6 +394,7 @@ export default {
       env.BOT_STATE.get("last_run_id"),
       env.BOT_STATE.get("last_run_duration_ms"),
       env.BOT_STATE.get("last_run_tx_count"),
+      env.BOT_STATE.get(DEPLOYER_CURSOR_KEY),
     ]);
 
     const now = Date.now();
@@ -283,7 +407,6 @@ export default {
     const cronEveryMinutes = getCronEveryMinutes(env);
     const nextRun = nextCronMs(now, cronEveryMinutes);
 
-    // lock is considered "active" only if it's non-empty
     const lockVal = (lock || "").trim();
     const running = lockVal.length > 0;
 
@@ -307,7 +430,10 @@ export default {
           cronEveryMinutes,
           nextRun,
           secondsToNextRun: Math.max(0, Math.floor((nextRun - now) / 1000)),
-          lastError: (lastError && lastError.trim()) ? lastError : null,
+          lastError: lastError && lastError.trim() ? lastError : null,
+
+          // helpful for debugging discovery
+          deployerCursorBlock: deployerBlockRaw ? Number(deployerBlockRaw) : null,
         },
         null,
         2
@@ -384,8 +510,6 @@ export default {
 
       const currentLockRaw = await env.BOT_STATE.get("lock");
       const currentLock = (currentLockRaw || "").trim();
-
-      // ✅ NO delete — unlock via short TTL sentinel
       if (currentLock === runId) {
         await kvUnlockSafe(env, 10);
         console.log(`🔓 Lock released (sentinel)`);
@@ -394,115 +518,125 @@ export default {
   },
 };
 
+// -------------------- Core logic --------------------
+
 async function runLogic(env: Env, startTimeMs: number): Promise<number> {
-  if (!env.BOT_PRIVATE_KEY || !env.REGISTRY_ADDRESS) {
-    throw new Error("Missing Env: BOT_PRIVATE_KEY/REGISTRY_ADDRESS");
+  if (!env.BOT_PRIVATE_KEY || !env.REGISTRY_ADDRESS || !env.DEPLOYER_ADDRESS) {
+    throw new Error("Missing Env: BOT_PRIVATE_KEY/REGISTRY_ADDRESS/DEPLOYER_ADDRESS");
   }
 
   const rpcUrl = env.RPC_URL || "https://node.mainnet.etherlink.com";
   const account = privateKeyToAccount(env.BOT_PRIVATE_KEY as Hex);
 
-  const transport = http(rpcUrl, {
-    timeout: 12_000,
-    retryCount: 2,
-    retryDelay: 400,
-  });
-
+  const transport = http(rpcUrl, { timeout: 12_000, retryCount: 2, retryDelay: 400 });
   const client = createPublicClient({ chain: etherlink, transport });
   const wallet = createWalletClient({ account, chain: etherlink, transport });
 
   console.log(`👛 Bot address: ${account.address}`);
   console.log(`🌐 RPC: ${rpcUrl}`);
 
-  const HOT_SIZE = getSafeSize(env.HOT_SIZE, 100n, 500n);
-  const COLD_SIZE = getSafeSize(env.COLD_SIZE, 50n, 200n);
-
   const MAX_TX = getSafeInt(env.MAX_TX, 5, 25);
   const TIME_BUDGET_MS = getSafeInt(env.TIME_BUDGET_MS, 25_000, 45_000);
   const ATTEMPT_TTL_SEC = getSafeInt(env.ATTEMPT_TTL_SEC, 600, 3600);
 
-  const total = await withRetry(
-    () =>
-      client.readContract({
-        address: env.REGISTRY_ADDRESS as Address,
-        abi: registryAbi,
-        functionName: "getAllLotteriesCount",
-      }),
-    { tries: 3, baseDelayMs: 250, label: "getAllLotteriesCount" }
-  );
+  // (A) On-chain discovery (Deployer logs) — no indexer
+  await pollDeployerForNewLotteries(env, client);
 
-  if (total === 0n) {
-    console.log("ℹ️ Registry empty. Done.");
-    return 0;
-  }
+  // (B) Active-set processing
+  const actives = await listActive(env, 2500);
 
-  const clampSize = async (start: bigint, limit: bigint): Promise<bigint> => {
-    if (limit <= 0n) return 0n;
-    const [end] = await withRetry(
+  // (C) Safety scan occasionally (registry cursor) — belt & suspenders
+  const runNo = await bumpRunCounter(env);
+  const safetyEvery = getSafeInt(env.SAFETY_SCAN_EVERY_RUNS, 30, 500);
+  const doSafetyScan = runNo % safetyEvery === 0;
+
+  let safetyCandidates: Address[] = [];
+  if (doSafetyScan) {
+    console.log(`🛟 Safety scan enabled this run (every ${safetyEvery} runs)`);
+
+    const HOT_SIZE = getSafeSize(env.HOT_SIZE, 100n, 500n);
+    const COLD_SIZE = getSafeSize(env.COLD_SIZE, 50n, 200n);
+
+    const total = await withRetry(
       () =>
         client.readContract({
           address: env.REGISTRY_ADDRESS as Address,
           abi: registryAbi,
-          functionName: "getAllLotteriesPageBounds",
-          args: [start, limit],
+          functionName: "getAllLotteriesCount",
         }),
-      { tries: 3, baseDelayMs: 200, label: "getAllLotteriesPageBounds" }
+      { tries: 3, baseDelayMs: 250, label: "getAllLotteriesCount" }
     );
-    const endBig = BigInt(end as unknown as bigint);
-    if (endBig <= start) return 0n;
-    return endBig - start;
-  };
 
-  const startHot = total > HOT_SIZE ? total - HOT_SIZE : 0n;
-
-  const savedCursor = await env.BOT_STATE.get("cursor");
-  let cursor = savedCursor ? BigInt(savedCursor) : 0n;
-  if (cursor >= total) cursor = 0n;
-
-  const startCold = cursor;
-
-  const safeHotSize = await clampSize(startHot, HOT_SIZE);
-  const safeColdSize = await clampSize(startCold, COLD_SIZE);
-
-  console.log(
-    `🔍 Scanning: Hot[${startHot}..${startHot + safeHotSize}) Cold[${startCold}..${startCold + safeColdSize}) total=${total}`
-  );
-
-  const [hotBatch, coldBatch] = await withRetry(
-    async () => {
-      const [h, c] = await Promise.all([
-        safeHotSize > 0n
-          ? client.readContract({
+    if (total > 0n) {
+      const clampSize = async (start: bigint, limit: bigint): Promise<bigint> => {
+        if (limit <= 0n) return 0n;
+        const [end] = await withRetry(
+          () =>
+            client.readContract({
               address: env.REGISTRY_ADDRESS as Address,
               abi: registryAbi,
-              functionName: "getAllLotteries",
-              args: [startHot, safeHotSize],
-            })
-          : Promise.resolve([] as Address[]),
-        safeColdSize > 0n
-          ? client.readContract({
-              address: env.REGISTRY_ADDRESS as Address,
-              abi: registryAbi,
-              functionName: "getAllLotteries",
-              args: [startCold, safeColdSize],
-            })
-          : Promise.resolve([] as Address[]),
-      ]);
-      return [h, c] as const;
-    },
-    { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
-  );
+              functionName: "getAllLotteriesPageBounds",
+              args: [start, limit],
+            }),
+          { tries: 3, baseDelayMs: 200, label: "getAllLotteriesPageBounds" }
+        );
+        const endBig = BigInt(end as unknown as bigint);
+        if (endBig <= start) return 0n;
+        return endBig - start;
+      };
 
-  let nextCursor = startCold + safeColdSize;
-  if (nextCursor >= total) nextCursor = 0n;
+      const startHot = total > HOT_SIZE ? total - HOT_SIZE : 0n;
 
-  const candidates = Array.from(new Set([...hotBatch, ...coldBatch]));
+      const savedCursor = await env.BOT_STATE.get("cursor");
+      let cursor = savedCursor ? BigInt(savedCursor) : 0n;
+      if (cursor >= total) cursor = 0n;
+
+      const startCold = cursor;
+
+      const safeHotSize = await clampSize(startHot, HOT_SIZE);
+      const safeColdSize = await clampSize(startCold, COLD_SIZE);
+
+      const [hotBatch, coldBatch] = await withRetry(
+        async () => {
+          const [h, c] = await Promise.all([
+            safeHotSize > 0n
+              ? client.readContract({
+                  address: env.REGISTRY_ADDRESS as Address,
+                  abi: registryAbi,
+                  functionName: "getAllLotteries",
+                  args: [startHot, safeHotSize],
+                })
+              : Promise.resolve([] as Address[]),
+            safeColdSize > 0n
+              ? client.readContract({
+                  address: env.REGISTRY_ADDRESS as Address,
+                  abi: registryAbi,
+                  functionName: "getAllLotteries",
+                  args: [startCold, safeColdSize],
+                })
+              : Promise.resolve([] as Address[]),
+          ]);
+          return [h, c] as const;
+        },
+        { tries: 3, baseDelayMs: 250, label: "getAllLotteries batches" }
+      );
+
+      let nextCursor = startCold + safeColdSize;
+      if (nextCursor >= total) nextCursor = 0n;
+      await kvPutSafe(env, "cursor", nextCursor.toString(), 365 * 24 * 3600);
+
+      safetyCandidates = Array.from(new Set([...(hotBatch as Address[]), ...(coldBatch as Address[])]));
+      console.log(`🛟 Safety candidates=${safetyCandidates.length}`);
+    }
+  }
+
+  const candidates = Array.from(new Set([...actives, ...safetyCandidates]));
   if (candidates.length === 0) {
-    console.log("ℹ️ No candidates. Done.");
-    await env.BOT_STATE.put("cursor", nextCursor.toString());
+    console.log("ℹ️ No active candidates. Done.");
     return 0;
   }
 
+  // status multicall
   const statusResults = await withRetry(
     () =>
       client.multicall({
@@ -515,28 +649,31 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     { tries: 3, baseDelayMs: 250, label: "status multicall" }
   );
 
-  const statusFailures = statusResults.filter((r) => r.status !== "success").length;
-  console.log(`🧪 status multicall: total=${statusResults.length} failures=${statusFailures}`);
-
   const openLotteries: Address[] = [];
   const drawingLotteries: Address[] = [];
+  const doneLotteries: Address[] = [];
 
   for (let i = 0; i < candidates.length; i++) {
+    const addr = candidates[i];
     const r = statusResults[i];
-    if (r.status === "success") {
-      const s = BigInt(r.result as bigint);
-      console.log(`🔎 ${candidates[i]} status=${statusLabel(s)}`);
-      if (s === 1n) openLotteries.push(candidates[i]);
-      if (s === 2n) drawingLotteries.push(candidates[i]);
-    }
+
+    if (r.status !== "success") continue;
+
+    const s = BigInt(r.result as bigint);
+    console.log(`🔎 ${addr} status=${statusLabel(s)}`);
+
+    if (s === 1n) openLotteries.push(addr);
+    else if (s === 2n) drawingLotteries.push(addr);
+    else if (s === 3n || s === 4n) doneLotteries.push(addr);
+  }
+
+  // remove completed/canceled from active set (no delete)
+  for (const d of doneLotteries) {
+    await markInactive(env, d);
   }
 
   const currentNonceStart = await withRetry(
-    () =>
-      client.getTransactionCount({
-        address: account.address,
-        blockTag: "pending",
-      }),
+    () => client.getTransactionCount({ address: account.address, blockTag: "pending" }),
     { tries: 3, baseDelayMs: 300, label: "getTransactionCount(pending)" }
   );
 
@@ -548,7 +685,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   // -----------------------------
   if (openLotteries.length > 0) {
     console.log(`⚡ Found ${openLotteries.length} Open lotteries to analyze.`);
-
     const chunks = chunkArray(openLotteries, 25);
 
     for (const chunk of chunks) {
@@ -573,14 +709,13 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         { tries: 3, baseDelayMs: 250, label: "details multicall" }
       );
 
-      type Candidate = {
+      type Cand = {
         addr: Address;
         deadline: bigint;
         sold: bigint;
         minTickets: bigint;
         maxTickets: bigint;
         entropyAddr: Address;
-        providerAddr: Address;
         callbackGasLimit: number;
         isExpired: boolean;
         isFull: boolean;
@@ -588,7 +723,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         score: number;
       };
 
-      const actionable: Candidate[] = [];
+      const actionable: Cand[] = [];
 
       for (let i = 0; i < chunk.length; i++) {
         const lottery = chunk[i];
@@ -599,7 +734,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         const rMin = detailResults[baseIdx + 2];
         const rMax = detailResults[baseIdx + 3];
         const rEntropy = detailResults[baseIdx + 4];
-        const rProvider = detailResults[baseIdx + 5];
         const rReq = detailResults[baseIdx + 6];
         const rGas = detailResults[baseIdx + 7];
 
@@ -609,7 +743,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           rMin.status !== "success" ||
           rMax.status !== "success" ||
           rEntropy.status !== "success" ||
-          rProvider.status !== "success" ||
           rReq.status !== "success" ||
           rGas.status !== "success"
         )
@@ -624,14 +757,10 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         const maxTickets = BigInt(rMax.result as bigint);
 
         const entropyAddr = rEntropy.result as Address;
-        const providerAddr = rProvider.result as Address;
-
-        const gasBig = BigInt(rGas.result as any);
-        const callbackGasLimit = Number(gasBig);
+        const callbackGasLimit = Number(BigInt(rGas.result as any));
 
         const isExpired = tNow >= deadline;
         const isFull = maxTickets > 0n && sold >= maxTickets;
-
         if (!isExpired && !isFull) continue;
 
         const cancelPath = isExpired && sold < minTickets;
@@ -643,7 +772,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           minTickets,
           maxTickets,
           entropyAddr,
-          providerAddr,
           callbackGasLimit,
           isExpired,
           isFull,
@@ -653,7 +781,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       }
 
       if (actionable.length === 0) continue;
-
       actionable.sort((a, b) => b.score - a.score);
 
       for (const c of actionable) {
@@ -676,7 +803,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
               try {
                 return BigInt(cachedFee);
               } catch {
-                // fall through
+                // ignore
               }
             }
           }
@@ -693,7 +820,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           );
 
           const v = BigInt(fee);
-          await env.BOT_STATE.put(feeKey, v.toString(), { expirationTtl: 60 });
+          await kvPutSafe(env, feeKey, v.toString(), 60);
           return v;
         };
 
@@ -704,13 +831,12 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           } catch (e: any) {
             const msg = (e?.shortMessage || e?.message || "").toString();
             console.warn(`   ⚠️ FeeV2 lookup failed; skipping draw for now: ${msg}`);
-            await env.BOT_STATE.put(attemptKey, `feeFail:${Date.now()}`, {
-              expirationTtl: Math.min(300, ATTEMPT_TTL_SEC),
-            });
+            await kvPutSafe(env, attemptKey, `feeFail:${Date.now()}`, Math.min(300, ATTEMPT_TTL_SEC));
             continue;
           }
         }
 
+        // simulate (refresh fee once if WrongEntropyFee)
         let simulated = false;
         for (let simTry = 0; simTry < 2; simTry++) {
           try {
@@ -748,14 +874,14 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
             console.warn(`   ⏭️ Simulation revert: ${msg}`);
             const ttl = (!c.cancelPath && isWrongEntropyFeeMessage(msg)) ? 60 : Math.min(120, ATTEMPT_TTL_SEC);
-            await env.BOT_STATE.put(attemptKey, `revert:${Date.now()}`, { expirationTtl: ttl });
+            await kvPutSafe(env, attemptKey, `revert:${Date.now()}`, ttl);
             break;
           }
         }
 
         if (!simulated) continue;
 
-        await env.BOT_STATE.put(attemptKey, `${Date.now()}`, { expirationTtl: ATTEMPT_TTL_SEC });
+        await kvPutSafe(env, attemptKey, `${Date.now()}`, ATTEMPT_TTL_SEC);
 
         try {
           const nonceToUse = currentNonce;
@@ -775,6 +901,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           currentNonce++;
           console.log(`   ✅ Tx Sent: ${hash}`);
           txCount++;
+
+          // keep it active (refresh TTL) — in case more checks needed for hatch
+          await addActive(env, c.addr);
         } catch (e: any) {
           const msg = (e?.shortMessage || e?.message || "").toString();
           console.warn(`   ⏭️ Tx failed: ${msg}`);
@@ -831,13 +960,11 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ Hatch simulation revert: ${msg}`);
-        await env.BOT_STATE.put(attemptKey, `revert:${Date.now()}`, {
-          expirationTtl: Math.min(300, ATTEMPT_TTL_SEC),
-        });
+        await kvPutSafe(env, attemptKey, `revert:${Date.now()}`, Math.min(300, ATTEMPT_TTL_SEC));
         continue;
       }
 
-      await env.BOT_STATE.put(attemptKey, `${Date.now()}`, { expirationTtl: ATTEMPT_TTL_SEC });
+      await kvPutSafe(env, attemptKey, `${Date.now()}`, ATTEMPT_TTL_SEC);
 
       try {
         const nonceToUse = currentNonce;
@@ -856,6 +983,10 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         currentNonce++;
         console.log(`   ✅ forceCancelStuck Tx Sent: ${hash}`);
         txCount++;
+
+        // likely ends the lottery; we'll drop it next run when status updates,
+        // but keep active TTL fresh so we keep watching.
+        await addActive(env, addr);
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ forceCancelStuck Tx failed: ${msg}`);
@@ -863,8 +994,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     }
   }
 
-  await env.BOT_STATE.put("cursor", nextCursor.toString());
-  console.log(`🏁 Run complete. txCount=${txCount} cursor=${nextCursor.toString()}`);
-
+  console.log(`🏁 Run complete. txCount=${txCount} actives=${actives.length} candidates=${candidates.length}`);
   return txCount;
 }
