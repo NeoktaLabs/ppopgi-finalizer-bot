@@ -24,13 +24,18 @@ LOG_CHUNK_BLOCKS = "250"
 BOOTSTRAP_LOOKBACK_BLOCKS = "50000"
 DEPLOYER_HEAD_LAG_BLOCKS = "2"
 
-# ✅ NEW: TicketsPurchased sold-out fast-path tuning
+# ✅ TicketsPurchased sold-out fast-path tuning
 # How far back (from head) to scan tickets purchases to catch "just sold out" quickly.
 TICKETS_LOOKBACK_BLOCKS = "2500"
 # How many lottery addresses to include per getLogs(address[]) call.
 TICKETS_ADDR_CHUNK = "50"
 # Head lag to avoid edge cases on reorg / latest block issues.
 TICKETS_HEAD_LAG_BLOCKS = "2"
+
+# ✅ NEW: extra safety buffer BEFORE forceCancelStuck()
+# Hatch opens at +2h on-chain; bot will only cancel after +2h + this buffer.
+# Default in code is 900 (15 minutes), but set it explicitly here.
+HATCH_EXTRA_DELAY_SEC = "300"
 
 # KV binding
 [[kv_namespaces]]
