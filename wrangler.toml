@@ -3,9 +3,6 @@ name = "ppopgi-finalizer-bot"
 main = "src/BotFinalizeLottery.ts"
 compatibility_date = "2026-02-23"
 
-# ✅ Required for Durable Objects
-compatibility_flags = ["durable_object_fetch"]
-
 # Non-secret env vars (safe in git)
 [vars]
 REGISTRY_ADDRESS = "0xa916e20AbF4d57bCb98f7A845eb74f2EB4Dcbed2"
@@ -43,14 +40,13 @@ HATCH_EXTRA_DELAY_SEC = "300"
 binding = "BOT_STATE"
 id = "7be58949d65d4f4d8fa11bab19cbfb0c"
 
-# ✅ Durable Object binding
+# Durable Object binding
 [durable_objects]
 bindings = [
   { name = "BOT_LOCK", class_name = "BotLockDO" }
 ]
 
-# ✅ Free plan Durable Objects require SQLite-backed classes
-# NOTE: If you've ever deployed with tag="v1" already, bump to v2/v3/etc.
+# ✅ Free plan Durable Objects must be created with SQLite-backed classes
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["BotLockDO"]
