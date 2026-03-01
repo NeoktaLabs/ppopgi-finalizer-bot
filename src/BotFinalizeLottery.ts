@@ -39,12 +39,12 @@ export interface Env {
   BOOTSTRAP_LOOKBACK_BLOCKS?: string; // default 50_000
   DEPLOYER_HEAD_LAG_BLOCKS?: string; // default 2
 
-  // ✅ NEW: TicketsPurchased scan tuning for sold-out fast-path
+  // ✅ TicketsPurchased scan tuning for sold-out fast-path
   TICKETS_LOOKBACK_BLOCKS?: string; // default 2500
   TICKETS_ADDR_CHUNK?: string; // default 50
   TICKETS_HEAD_LAG_BLOCKS?: string; // default 2
 
-  // ✅ NEW: extra safety buffer BEFORE forceCancelStuck()
+  // ✅ extra safety buffer BEFORE forceCancelStuck()
   // Default 900 (15 minutes) if unset. (Hatch opens at +2h on-chain; bot waits +2h + buffer)
   HATCH_EXTRA_DELAY_SEC?: string; // default 900
 }
@@ -68,7 +68,7 @@ const lotteryAbi = parseAbi([
   "function entropyRequestId() external view returns (uint64)",
   "function callbackGasLimit() external view returns (uint32)",
   "function isHatchOpen() external view returns (bool)",
-  // ✅ NEW: to add an extra buffer beyond hatch opening
+  // ✅ to add an extra buffer beyond hatch opening
   "function drawingRequestedAt() external view returns (uint64)",
   "function finalize() external payable",
   "function forceCancelStuck() external",
@@ -291,7 +291,7 @@ type BotStateV1 = {
   deployerCursor?: string; // bigint-as-string
   registryCursor?: string; // bigint-as-string
 
-  // ✅ NEW: TicketsPurchased log cursor (bigint-as-string)
+  // TicketsPurchased log cursor (bigint-as-string)
   ticketsCursor?: string;
 
   runCounter: number;
@@ -402,7 +402,7 @@ async function pollDeployerForNewLotteries(
 
   const lastScanned = parseBigIntOrNull(state.deployerCursor ?? (await env.BOT_STATE.get(DEPLOYER_CURSOR_KEY_FALLBACK)));
 
-  // ✅ Never bootstrap from 0 unless chain head is tiny
+  // Never bootstrap from 0 unless chain head is tiny
   const bootstrapFrom = toBlock > lookbackBlocks ? toBlock - lookbackBlocks : 0n;
 
   let fromBlock = lastScanned != null ? lastScanned + 1n : bootstrapFrom;
@@ -545,7 +545,7 @@ async function registryRollingScan(
   return { hotAdded, coldAdded, total: totalBig };
 }
 
-// -------------------- NEW: Sold-out fast-path via TicketsPurchased logs --------------------
+// -------------------- Sold-out fast-path via TicketsPurchased logs --------------------
 
 async function pollSoldOutFromTicketsPurchased(
   env: Env,
@@ -965,7 +965,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const TIME_BUDGET_MS = getSafeInt(env.TIME_BUDGET_MS, 25_000, 45_000);
   const ATTEMPT_TTL_SEC = getSafeInt(env.ATTEMPT_TTL_SEC, 600, 3600);
 
-  // ✅ NEW: extra time buffer beyond hatch opening (default 15m)
+  // extra time buffer beyond hatch opening (default 15m)
   const HATCH_EXTRA_DELAY_SEC = getSafeInt(env.HATCH_EXTRA_DELAY_SEC, 900, 24 * 3600);
 
   const state = await loadState(env);
@@ -1015,14 +1015,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   // -----------------------------
   // (B) SOLD-OUT FAST-PATH (tickets logs near head)
   // -----------------------------
-  const urgentSoldOut = await pollSoldOutFromTicketsPurchased(
-    env,
-    state,
-    client,
-    startTimeMs,
-    TIME_BUDGET_MS,
-    candidates // scanning the bounded set keeps RPC predictable
-  );
+  const urgentSoldOut = await pollSoldOutFromTicketsPurchased(env, state, client, startTimeMs, TIME_BUDGET_MS, candidates);
 
   // status multicall
   const statusResults = await withRetry(
@@ -1049,7 +1042,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     const r = statusResults[i];
     if (r.status !== "success") continue;
 
-    const s = Number(BigInt(r.result as bigint));
+    const s = Number(BigInt(r.result as any));
     const wk = watchKey(addr);
     if (state.watch[wk]) {
       state.watch[wk].lastStatus = s;
@@ -1075,7 +1068,6 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     );
   }
 
-  // Helpful summary log
   console.log(
     `📊 Watchlist summary: total=${Object.keys(state.watch).length} checked=${candidates.length} open=${openLotteries.length} drawing=${drawingLotteries.length} done=${doneLotteries.length} (before=${beforeWatchCount}, afterDiscovery=${afterDiscoveryCount})`
   );
@@ -1090,7 +1082,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
   // -----------------------------
   // 1) Finalize Open lotteries
-  //    ✅ Urgent sold-out first
+  //    Urgent sold-out first
   // -----------------------------
   if (openLotteries.length > 0) {
     const urgentSet = new Set(urgentSoldOut.map((a) => lower(a)));
@@ -1111,7 +1103,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       const tNowSec = BigInt(nowSec());
 
-      // ✅ NEW: include status() in detail calls and require Open at decision time
+      // include status() and require Open at decision time
       // 9 calls per address:
       // 0 status
       // 1 deadline
@@ -1200,7 +1192,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
         const cancelPath = isExpired && sold < minTickets;
 
-        // ✅ defensive: never try draw-path with sold==0
+        // defensive: never try draw-path with sold==0
         if (!cancelPath && sold === 0n) continue;
 
         actionable.push({
@@ -1265,7 +1257,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
             { tries: 3, baseDelayMs: 250, label: "entropy.getFeeV2" }
           );
 
-          const v = BigInt(fee);
+          const v = BigInt(fee as any);
           await kvPutSafe(env, feeKey, v.toString(), 60);
           return v;
         };
@@ -1326,7 +1318,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           }
         }
 
-        // ✅ NEW: only throttle if not transient
+        // only throttle if not transient
         if (!simWasTransient) {
           markAttempt(state, attemptKey);
         }
@@ -1354,11 +1346,11 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         } catch (e: any) {
           const msg = (e?.shortMessage || e?.message || "").toString();
           console.warn(`   ⏭️ finalize Tx failed: ${msg}`);
-          // ✅ NEW: resync nonce on send errors
+          // resync nonce on send errors
           currentNonce = await resyncNonce(client, account.address, currentNonce);
         }
 
-        // Optional: resync occasionally (cheap when MAX_TX is small)
+        // resync occasionally (cheap when MAX_TX is small)
         if (txCount > 0 && txCount % 2 === 0) {
           currentNonce = await resyncNonce(client, account.address, currentNonce);
         }
@@ -1374,7 +1366,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   if (drawingLotteries.length > 0 && txCount < MAX_TX && Date.now() - startTimeMs <= TIME_BUDGET_MS) {
     console.log(`🧯 Found ${drawingLotteries.length} Drawing lotteries to check for hatch.`);
 
-    // ✅ NEW: fetch isHatchOpen + drawingRequestedAt for safety buffer decision
+    // fetch isHatchOpen + drawingRequestedAt for safety buffer decision
     const hatchResults = await withRetry(
       () =>
         client.multicall({
