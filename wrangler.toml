@@ -1,6 +1,10 @@
+# wrangler.toml
 name = "ppopgi-finalizer-bot"
 main = "src/BotFinalizeLottery.ts"
 compatibility_date = "2026-02-23"
+
+# ✅ Required for Durable Objects
+compatibility_flags = ["durable_object_fetch"]
 
 # Non-secret env vars (safe in git)
 [vars]
@@ -27,22 +31,28 @@ BOOTSTRAP_LOOKBACK_BLOCKS = "50000"
 DEPLOYER_HEAD_LAG_BLOCKS = "2"
 
 # TicketsPurchased sold-out fast-path tuning
-# How far back (from head) to scan tickets purchases to catch "just sold out" quickly.
 TICKETS_LOOKBACK_BLOCKS = "2500"
-# How many lottery addresses to include per getLogs(address[]) call.
 TICKETS_ADDR_CHUNK = "50"
-# Head lag to avoid edge cases on reorg / latest block issues.
 TICKETS_HEAD_LAG_BLOCKS = "2"
 
 # extra safety buffer BEFORE forceCancelStuck()
-# Hatch opens at +2h on-chain; bot will only cancel after +2h + this buffer.
-# Default in code is 900 (15 minutes), but set it explicitly here.
 HATCH_EXTRA_DELAY_SEC = "300"
 
 # KV binding
 [[kv_namespaces]]
 binding = "BOT_STATE"
 id = "7be58949d65d4f4d8fa11bab19cbfb0c"
+
+# ✅ Durable Object binding
+[durable_objects]
+bindings = [
+  { name = "BOT_LOCK", class_name = "BotLockDO" }
+]
+
+# ✅ Required DO migration block (bump tag when you change classes/bindings)
+[[migrations]]
+tag = "v1"
+new_classes = ["BotLockDO"]
 
 [observability]
 enabled = false
