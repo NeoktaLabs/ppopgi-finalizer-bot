@@ -49,10 +49,11 @@ bindings = [
   { name = "BOT_LOCK", class_name = "BotLockDO" }
 ]
 
-# ✅ Required DO migration block (bump tag when you change classes/bindings)
+# ✅ Free plan Durable Objects require SQLite-backed classes
+# NOTE: If you've ever deployed with tag="v1" already, bump to v2/v3/etc.
 [[migrations]]
 tag = "v1"
-new_classes = ["BotLockDO"]
+new_sqlite_classes = ["BotLockDO"]
 
 [observability]
 enabled = false
