@@ -43,6 +43,10 @@ export interface Env {
   TICKETS_LOOKBACK_BLOCKS?: string; // default 2500
   TICKETS_ADDR_CHUNK?: string; // default 50
   TICKETS_HEAD_LAG_BLOCKS?: string; // default 2
+
+  // ✅ NEW: extra safety buffer BEFORE forceCancelStuck()
+  // Default 900 (15 minutes) if unset. (Hatch opens at +2h on-chain; bot waits +2h + buffer)
+  HATCH_EXTRA_DELAY_SEC?: string; // default 900
 }
 
 // -------------------- ABIs --------------------
@@ -64,6 +68,8 @@ const lotteryAbi = parseAbi([
   "function entropyRequestId() external view returns (uint64)",
   "function callbackGasLimit() external view returns (uint32)",
   "function isHatchOpen() external view returns (bool)",
+  // ✅ NEW: to add an extra buffer beyond hatch opening
+  "function drawingRequestedAt() external view returns (uint64)",
   "function finalize() external payable",
   "function forceCancelStuck() external",
 ]);
@@ -240,6 +246,23 @@ async function kvUnlockSafe(env: Env, ttlSec = 10) {
     await env.BOT_STATE.put("lock", "", { expirationTtl: Math.max(5, ttlSec) });
   } catch {
     // ignore
+  }
+}
+
+// ✅ NEW: nonce resync helper (prevents "broadcast succeeded but client errored" nonce drift)
+async function resyncNonce(
+  client: ReturnType<typeof createPublicClient>,
+  address: Address,
+  currentNonce: bigint
+): Promise<bigint> {
+  try {
+    const pending = await withRetry(
+      () => client.getTransactionCount({ address, blockTag: "pending" }),
+      { tries: 2, baseDelayMs: 250, label: "getTransactionCount(pending) resync" }
+    );
+    return pending > currentNonce ? pending : currentNonce;
+  } catch {
+    return currentNonce;
   }
 }
 
@@ -942,6 +965,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   const TIME_BUDGET_MS = getSafeInt(env.TIME_BUDGET_MS, 25_000, 45_000);
   const ATTEMPT_TTL_SEC = getSafeInt(env.ATTEMPT_TTL_SEC, 600, 3600);
 
+  // ✅ NEW: extra time buffer beyond hatch opening (default 15m)
+  const HATCH_EXTRA_DELAY_SEC = getSafeInt(env.HATCH_EXTRA_DELAY_SEC, 900, 24 * 3600);
+
   const state = await loadState(env);
   state.runCounter += 1;
 
@@ -1085,7 +1111,19 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       const tNowSec = BigInt(nowSec());
 
+      // ✅ NEW: include status() in detail calls and require Open at decision time
+      // 9 calls per address:
+      // 0 status
+      // 1 deadline
+      // 2 sold
+      // 3 minTickets
+      // 4 maxTickets
+      // 5 entropy
+      // 6 entropyProvider (kept)
+      // 7 entropyRequestId
+      // 8 callbackGasLimit
       const detailCalls = chunk.flatMap((addr) => [
+        { address: addr, abi: lotteryAbi, functionName: "status" },
         { address: addr, abi: lotteryAbi, functionName: "deadline" },
         { address: addr, abi: lotteryAbi, functionName: "getSold" },
         { address: addr, abi: lotteryAbi, functionName: "minTickets" },
@@ -1119,17 +1157,19 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
       for (let i = 0; i < chunk.length; i++) {
         const lottery = chunk[i];
-        const baseIdx = i * 8;
+        const baseIdx = i * 9;
 
-        const rDeadline = detailResults[baseIdx];
-        const rSold = detailResults[baseIdx + 1];
-        const rMin = detailResults[baseIdx + 2];
-        const rMax = detailResults[baseIdx + 3];
-        const rEntropy = detailResults[baseIdx + 4];
-        const rReq = detailResults[baseIdx + 6];
-        const rGas = detailResults[baseIdx + 7];
+        const rStatus = detailResults[baseIdx];
+        const rDeadline = detailResults[baseIdx + 1];
+        const rSold = detailResults[baseIdx + 2];
+        const rMin = detailResults[baseIdx + 3];
+        const rMax = detailResults[baseIdx + 4];
+        const rEntropy = detailResults[baseIdx + 5];
+        const rReq = detailResults[baseIdx + 7];
+        const rGas = detailResults[baseIdx + 8];
 
         if (
+          rStatus.status !== "success" ||
           rDeadline.status !== "success" ||
           rSold.status !== "success" ||
           rMin.status !== "success" ||
@@ -1140,13 +1180,16 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         )
           continue;
 
-        const reqId = BigInt(rReq.result as bigint);
+        const statusNow = BigInt(rStatus.result as any);
+        if (statusNow !== 1n) continue; // must still be Open
+
+        const reqId = BigInt(rReq.result as any);
         if (reqId !== 0n) continue;
 
-        const deadline = BigInt(rDeadline.result as bigint);
-        const sold = BigInt(rSold.result as bigint);
-        const minTickets = BigInt(rMin.result as bigint);
-        const maxTickets = BigInt(rMax.result as bigint);
+        const deadline = BigInt(rDeadline.result as any);
+        const sold = BigInt(rSold.result as any);
+        const minTickets = BigInt(rMin.result as any);
+        const maxTickets = BigInt(rMax.result as any);
 
         const entropyAddr = rEntropy.result as Address;
         const callbackGasLimit = Number(BigInt(rGas.result as any));
@@ -1156,6 +1199,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         if (!isExpired && !isFull) continue;
 
         const cancelPath = isExpired && sold < minTickets;
+
+        // ✅ defensive: never try draw-path with sold==0
+        if (!cancelPath && sold === 0n) continue;
 
         actionable.push({
           addr: lottery,
@@ -1190,7 +1236,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         if (!canAttempt(state, attemptKey, ATTEMPT_TTL_SEC)) continue;
 
         console.log(
-          `🚀 Finalize candidate: ${c.addr} (urgent=${urgentSet.has(lower(c.addr))} expired=${c.isExpired} full=${c.isFull} sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath} gas=${c.callbackGasLimit})`
+          `🚀 Finalize candidate: ${c.addr} (urgent=${urgentSet.has(lower(c.addr))} expired=${c.isExpired} full=${
+            c.isFull
+          } sold=${c.sold} min=${c.minTickets} max=${c.maxTickets} cancelPath=${c.cancelPath} gas=${c.callbackGasLimit})`
         );
 
         const fetchFeeV2 = async (useCache: boolean): Promise<bigint> => {
@@ -1236,6 +1284,8 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
         // simulate (refresh fee once if WrongEntropyFee)
         let simulated = false;
+        let simWasTransient = false;
+
         for (let simTry = 0; simTry < 2; simTry++) {
           try {
             await withRetry(
@@ -1267,6 +1317,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
 
             if (isTransientErrorMessage(msg)) {
               console.warn(`   🌧️ Transient sim error (will retry next run): ${msg}`);
+              simWasTransient = true;
               break;
             }
 
@@ -1275,8 +1326,10 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           }
         }
 
-        // throttle regardless (prevents spam)
-        markAttempt(state, attemptKey);
+        // ✅ NEW: only throttle if not transient
+        if (!simWasTransient) {
+          markAttempt(state, attemptKey);
+        }
 
         if (!simulated) continue;
 
@@ -1301,6 +1354,13 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         } catch (e: any) {
           const msg = (e?.shortMessage || e?.message || "").toString();
           console.warn(`   ⏭️ finalize Tx failed: ${msg}`);
+          // ✅ NEW: resync nonce on send errors
+          currentNonce = await resyncNonce(client, account.address, currentNonce);
+        }
+
+        // Optional: resync occasionally (cheap when MAX_TX is small)
+        if (txCount > 0 && txCount % 2 === 0) {
+          currentNonce = await resyncNonce(client, account.address, currentNonce);
         }
       }
     }
@@ -1314,32 +1374,48 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   if (drawingLotteries.length > 0 && txCount < MAX_TX && Date.now() - startTimeMs <= TIME_BUDGET_MS) {
     console.log(`🧯 Found ${drawingLotteries.length} Drawing lotteries to check for hatch.`);
 
+    // ✅ NEW: fetch isHatchOpen + drawingRequestedAt for safety buffer decision
     const hatchResults = await withRetry(
       () =>
         client.multicall({
-          contracts: drawingLotteries.map((addr) => ({
-            address: addr,
-            abi: lotteryAbi,
-            functionName: "isHatchOpen",
-          })),
+          contracts: drawingLotteries.flatMap((addr) => [
+            { address: addr, abi: lotteryAbi, functionName: "isHatchOpen" },
+            { address: addr, abi: lotteryAbi, functionName: "drawingRequestedAt" },
+          ]),
         }),
-      { tries: 3, baseDelayMs: 250, label: "isHatchOpen multicall" }
+      { tries: 3, baseDelayMs: 250, label: "hatch multicall (isHatchOpen + drawingRequestedAt)" }
     );
+
+    const nowS = nowSec();
 
     for (let i = 0; i < drawingLotteries.length; i++) {
       if (txCount >= MAX_TX) break;
       if (Date.now() - startTimeMs > TIME_BUDGET_MS) break;
 
       const addr = drawingLotteries[i];
-      const r = hatchResults[i];
-      if (r.status !== "success") continue;
-      if (r.result !== true) continue;
+      const rHatch = hatchResults[i * 2];
+      const rDrawAt = hatchResults[i * 2 + 1];
+
+      if (rHatch.status !== "success" || rDrawAt.status !== "success") continue;
+      if (rHatch.result !== true) continue;
+
+      const drawingRequestedAt = Number(BigInt(rDrawAt.result as any));
+      if (!Number.isFinite(drawingRequestedAt) || drawingRequestedAt <= 0) continue;
+
+      // Wait hatch open (+2h in-contract) + extra buffer
+      const ok = nowS > drawingRequestedAt + 2 * 3600 + HATCH_EXTRA_DELAY_SEC;
+      if (!ok) {
+        const wait = drawingRequestedAt + 2 * 3600 + HATCH_EXTRA_DELAY_SEC - nowS;
+        console.log(`   ⏳ Hatch open but waiting buffer for ${addr}: wait ~${wait}s`);
+        continue;
+      }
 
       const attemptKey = `hatch:${lower(addr)}`;
       if (!canAttempt(state, attemptKey, ATTEMPT_TTL_SEC)) continue;
 
-      console.log(`🧯 Hatch open: ${addr} -> forceCancelStuck()`);
+      console.log(`🧯 Hatch open (+buffer): ${addr} -> forceCancelStuck()`);
 
+      let simWasTransient = false;
       try {
         await withRetry(
           () =>
@@ -1354,10 +1430,12 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ Hatch simulation revert: ${msg}`);
-        markAttempt(state, attemptKey);
+        if (isTransientErrorMessage(msg)) simWasTransient = true;
+        if (!simWasTransient) markAttempt(state, attemptKey);
         continue;
       }
 
+      // throttle hatch attempts
       markAttempt(state, attemptKey);
 
       try {
@@ -1380,6 +1458,7 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ forceCancelStuck Tx failed: ${msg}`);
+        currentNonce = await resyncNonce(client, account.address, currentNonce);
       }
     }
   }
