@@ -4,7 +4,7 @@ compatibility_date = "2026-02-23"
 
 # 🔁 Run every 1 minute
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/2 * * * *"]
 
 # Non-secret env vars (safe in git)
 [vars]
