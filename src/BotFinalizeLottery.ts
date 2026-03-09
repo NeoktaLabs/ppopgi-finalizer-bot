@@ -463,20 +463,29 @@ async function kvClearSafe(env: Env, key: string, ttlSec = 120) {
   }
 }
 
-// ✅ NEW: nonce resync helper (prevents "broadcast succeeded but client errored" nonce drift)
+// ✅ UPDATED: nonce resync helper
+// Prefer "latest" first for single-writer bots; only fall back to "pending".
 async function resyncNonce(
   client: ReturnType<typeof createPublicClient>,
   address: Address,
   currentNonce: bigint
 ): Promise<bigint> {
   try {
-    const pending = await withRetry(
-      () => client.getTransactionCount({ address, blockTag: "pending" }),
-      { tries: 2, baseDelayMs: 250, label: "getTransactionCount(pending) resync" }
+    const latest = await withRetry(
+      () => client.getTransactionCount({ address, blockTag: "latest" }),
+      { tries: 2, baseDelayMs: 250, label: "getTransactionCount(latest) resync" }
     );
-    return pending > currentNonce ? pending : currentNonce;
+    return latest > currentNonce ? latest : currentNonce;
   } catch {
-    return currentNonce;
+    try {
+      const pending = await withRetry(
+        () => client.getTransactionCount({ address, blockTag: "pending" }),
+        { tries: 1, baseDelayMs: 250, label: "getTransactionCount(pending) resync" }
+      );
+      return pending > currentNonce ? pending : currentNonce;
+    } catch {
+      return currentNonce;
+    }
   }
 }
 
@@ -1212,7 +1221,7 @@ export default {
 };
 
 // -------------------- Core logic --------------------
-// NOTE: runLogic and all remaining code below is unchanged from your original file.
+
 async function runLogic(env: Env, startTimeMs: number): Promise<number> {
   if (!env.BOT_PRIVATE_KEY || !env.REGISTRY_ADDRESS || !env.DEPLOYER_ADDRESS) {
     throw new Error("Missing Env: BOT_PRIVATE_KEY/REGISTRY_ADDRESS/DEPLOYER_ADDRESS");
@@ -1324,13 +1333,19 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
     `📊 Watchlist summary: total=${Object.keys(state.watch).length} checked=${candidates.length} open=${openLotteries.length} drawing=${drawingLotteries.length} done=${doneLotteries.length} (before=${beforeWatchCount}, afterDiscovery=${afterDiscoveryCount})`
   );
 
-  const currentNonceStart = await withRetry(
-    () => client.getTransactionCount({ address: account.address, blockTag: "pending" }),
-    { tries: 3, baseDelayMs: 300, label: "getTransactionCount(pending)" }
-  );
-
-  let currentNonce = currentNonceStart;
+  let currentNonce: bigint | null = null;
   let txCount = 0;
+
+  const getOrInitNonce = async (): Promise<bigint> => {
+    if (currentNonce !== null) return currentNonce;
+
+    currentNonce = await withRetry(
+      () => client.getTransactionCount({ address: account.address, blockTag: "latest" }),
+      { tries: 2, baseDelayMs: 300, label: "getTransactionCount(latest)" }
+    );
+
+    return currentNonce;
+  };
 
   if (openLotteries.length > 0) {
     const urgentSet = new Set(urgentSoldOut.map((a) => lower(a)));
@@ -1558,7 +1573,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
         if (!simulated) continue;
 
         try {
-          const nonceToUse = currentNonce;
+          await getOrInitNonce();
+
+          const nonceToUse = currentNonce!;
           const hash = await withRetry(
             () =>
               wallet.writeContract({
@@ -1572,17 +1589,15 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
             { tries: 2, baseDelayMs: 250, label: "send finalize tx" }
           );
 
-          currentNonce++;
+          currentNonce = nonceToUse + 1n;
           console.log(`   ✅ finalize Tx Sent: ${hash}`);
           txCount++;
         } catch (e: any) {
           const msg = (e?.shortMessage || e?.message || "").toString();
           console.warn(`   ⏭️ finalize Tx failed: ${msg}`);
-          currentNonce = await resyncNonce(client, account.address, currentNonce);
-        }
-
-        if (txCount > 0 && txCount % 2 === 0) {
-          currentNonce = await resyncNonce(client, account.address, currentNonce);
+          if (currentNonce !== null) {
+            currentNonce = await resyncNonce(client, account.address, currentNonce);
+          }
         }
       }
     }
@@ -1655,7 +1670,9 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
       markAttempt(state, attemptKey);
 
       try {
-        const nonceToUse = currentNonce;
+        await getOrInitNonce();
+
+        const nonceToUse = currentNonce!;
         const hash = await withRetry(
           () =>
             wallet.writeContract({
@@ -1668,13 +1685,15 @@ async function runLogic(env: Env, startTimeMs: number): Promise<number> {
           { tries: 2, baseDelayMs: 250, label: "send forceCancelStuck tx" }
         );
 
-        currentNonce++;
+        currentNonce = nonceToUse + 1n;
         console.log(`   ✅ forceCancelStuck Tx Sent: ${hash}`);
         txCount++;
       } catch (e: any) {
         const msg = (e?.shortMessage || e?.message || "").toString();
         console.warn(`   ⏭️ forceCancelStuck Tx failed: ${msg}`);
-        currentNonce = await resyncNonce(client, account.address, currentNonce);
+        if (currentNonce !== null) {
+          currentNonce = await resyncNonce(client, account.address, currentNonce);
+        }
       }
     }
   }
