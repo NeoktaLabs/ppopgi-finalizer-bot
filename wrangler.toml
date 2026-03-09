@@ -11,7 +11,7 @@ crons = ["*/2 * * * *"]
 REGISTRY_ADDRESS = "0xa916e20AbF4d57bCb98f7A845eb74f2EB4Dcbed2"
 DEPLOYER_ADDRESS = "0xAd0c8Ba0E4e519B4EA97cE945A20E2716dDbDf7D"
 
-RPC_URL = "https://rpc.ankr.com/etherlink_mainnet"
+RPC_URL = "https://node.mainnet.etherlink.com"
 CRON_EVERY_MINUTES = "2"
 
 MAX_TX = "10"
