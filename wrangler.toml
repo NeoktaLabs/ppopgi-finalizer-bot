@@ -2,7 +2,7 @@ name = "ppopgi-finalizer-bot"
 main = "src/BotFinalizeLottery.ts"
 compatibility_date = "2026-02-23"
 
-# 🔁 Run every 1 minute
+# 🔁 Run every 2 minutes
 [triggers]
 crons = ["*/2 * * * *"]
 
